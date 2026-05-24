@@ -1,0 +1,39 @@
+# Core
+numpy
+pandas
+scipy
+tabulate
+
+# Configuration
+pyyaml
+
+# Visualization
+matplotlib
+seaborn
+
+# Statistical Modelling
+statsmodels
+pmdarima
+
+# Machine Learning
+scikit-learn
+xgboost
+shap
+optuna
+
+# Deep Learning (PyTorch)
+torch
+
+# Serialisation & Utilities
+joblib
+tqdm
+openpyxl
+
+# Testing
+pytest
+pytest-cov
+
+# Notebook
+jupyter
+ipykernel
+nbformat

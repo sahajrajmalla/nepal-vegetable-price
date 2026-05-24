@@ -1,0 +1,342 @@
+# ============================================================================
+# Kalimati Vegetable Price Forecasting — Master Configuration
+# ============================================================================
+# This YAML controls the entire pipeline: data paths, commodity selection,
+# feature engineering, model hyperparameters, evaluation strategy, and outputs.
+# Modify this file to customise experiments without touching source code.
+# ============================================================================
+
+# ------------------------------------------------------------------
+# 1. Project Metadata
+# ------------------------------------------------------------------
+project:
+  name: "Kalimati Vegetable Price Forecasting"
+  version: "1.0.0"
+  description: >
+    Multi-model time-series forecasting of daily wholesale vegetable
+    prices at Nepal's Kalimati Fruits & Vegetables Market (2013-2023).
+  random_seed: 42
+
+# ------------------------------------------------------------------
+# 2. Data Paths (relative to project root)
+# ------------------------------------------------------------------
+data:
+  raw_dir: "../data/raw"
+  raw_files:
+    - "Kalimati Tarkari Prices from June 2013 to May 2021.csv"
+    - "Kalimati Tarkari Prices from May 2021 to September 2023.csv"
+  cleaned_dir: "outputs/cleaned_data"
+  interim_dir: "data/interim"
+
+# ------------------------------------------------------------------
+# 3. Target Commodities (configurable subset)
+# ------------------------------------------------------------------
+commodities:
+  # Top commodities by market importance and data availability
+  selected:
+    - "Tomato Big(Nepali)"
+    - "Tomato Small(Local)"
+    - "Potato Red"
+    - "Potato White"
+    - "Onion Dry (Indian)"
+    - "Cabbage(Local)"
+    - "Cauli Local"
+    - "Carrot(Local)"
+  # Fallback: run all commodities found in data
+  run_all: false
+
+# ------------------------------------------------------------------
+# 4. Data Preprocessing
+# ------------------------------------------------------------------
+preprocessing:
+  target_column: "Average"  # Primary forecast target
+  price_columns: ["Minimum", "Maximum", "Average"]
+  date_column: "Date"
+  commodity_column: "Commodity"
+  unit_column: "Unit"
+  # Outlier detection (IQR method)
+  outlier:
+    method: "iqr"
+    iqr_multiplier: 2.5  # Conservative for price data
+    min_price: 1.0       # Domain: prices must be >= Rs 1/kg
+    max_price: 1000.0    # Domain: cap at Rs 1000/kg
+  # Imputation
+  imputation:
+    method: "ffill_interpolate"  # forward-fill then linear interpolation
+    max_gap_days: 7              # Flag gaps longer than this
+  # Aggregation
+  aggregation:
+    daily: true
+    weekly: true
+    monthly: true
+
+# ------------------------------------------------------------------
+# 5. Feature Engineering
+# ------------------------------------------------------------------
+features:
+  lags: [1, 2, 3, 7, 14, 21, 30]
+  rolling_windows: [7, 14, 30]
+  rolling_stats: ["mean", "std", "min", "max", "median"]
+  ewma_spans: [7, 14, 30]
+  differencing_orders: [1, 7]
+  calendar:
+    dayofweek: true
+    month: true
+    dayofyear: true
+    is_weekend: true
+    sin_cos_encoding: true  # Cyclical encoding for day-of-year
+    quarter: true
+    week_of_year: true
+  spread: true  # Max - Min price spread
+  price_velocity: true  # Rate of price change
+  volatility: true  # Rolling coefficient of variation
+
+# ------------------------------------------------------------------
+# 6. Nepal Festival Calendar (approximate Gregorian dates)
+# ------------------------------------------------------------------
+festivals:
+  # Major Nepali festivals with typical price impact periods
+  # Dates are approximate — varies each year by Bikram Sambat calendar
+  dashain:
+    # Dashain typically falls in September-October (Ashwin)
+    approximate_dates:
+      - ["2013-10-05", "2013-10-19"]
+      - ["2014-09-25", "2014-10-08"]
+      - ["2015-10-15", "2015-10-28"]
+      - ["2016-10-02", "2016-10-15"]
+      - ["2017-09-21", "2017-10-04"]
+      - ["2018-10-10", "2018-10-23"]
+      - ["2019-09-29", "2019-10-12"]
+      - ["2020-10-17", "2020-10-30"]
+      - ["2021-10-07", "2021-10-20"]
+      - ["2022-09-26", "2022-10-09"]
+      - ["2023-10-15", "2023-10-28"]
+    lead_days: 7   # Price impact starts before festival
+    lag_days: 3    # Price impact lingers after festival
+
+  tihar:
+    approximate_dates:
+      - ["2013-11-01", "2013-11-05"]
+      - ["2014-10-21", "2014-10-25"]
+      - ["2015-11-09", "2015-11-13"]
+      - ["2016-10-28", "2016-11-01"]
+      - ["2017-10-17", "2017-10-21"]
+      - ["2018-11-05", "2018-11-09"]
+      - ["2019-10-25", "2019-10-29"]
+      - ["2020-11-13", "2020-11-17"]
+      - ["2021-11-02", "2021-11-06"]
+      - ["2022-10-22", "2022-10-26"]
+      - ["2023-11-11", "2023-11-15"]
+    lead_days: 5
+    lag_days: 2
+
+  chhath:
+    approximate_dates:
+      - ["2013-11-07", "2013-11-08"]
+      - ["2014-10-27", "2014-10-28"]
+      - ["2015-11-15", "2015-11-16"]
+      - ["2016-11-05", "2016-11-06"]
+      - ["2017-10-24", "2017-10-25"]
+      - ["2018-11-13", "2018-11-14"]
+      - ["2019-11-02", "2019-11-03"]
+      - ["2020-11-20", "2020-11-21"]
+      - ["2021-11-10", "2021-11-11"]
+      - ["2022-10-30", "2022-10-31"]
+      - ["2023-11-19", "2023-11-20"]
+    lead_days: 3
+    lag_days: 1
+
+  holi:
+    approximate_dates:
+      - ["2014-03-17", "2014-03-17"]
+      - ["2015-03-06", "2015-03-06"]
+      - ["2016-03-24", "2016-03-24"]
+      - ["2017-03-13", "2017-03-13"]
+      - ["2018-03-02", "2018-03-02"]
+      - ["2019-03-21", "2019-03-21"]
+      - ["2020-03-10", "2020-03-10"]
+      - ["2021-03-29", "2021-03-29"]
+      - ["2022-03-18", "2022-03-18"]
+      - ["2023-03-07", "2023-03-07"]
+    lead_days: 2
+    lag_days: 1
+
+  teej:
+    approximate_dates:
+      - ["2013-09-06", "2013-09-06"]
+      - ["2014-08-26", "2014-08-26"]
+      - ["2015-09-14", "2015-09-14"]
+      - ["2016-09-02", "2016-09-02"]
+      - ["2017-08-22", "2017-08-22"]
+      - ["2018-09-12", "2018-09-12"]
+      - ["2019-09-02", "2019-09-02"]
+      - ["2020-08-21", "2020-08-21"]
+      - ["2021-09-09", "2021-09-09"]
+      - ["2022-08-30", "2022-08-30"]
+      - ["2023-09-18", "2023-09-18"]
+    lead_days: 3
+    lag_days: 1
+
+  new_year:
+    # Nepali New Year (Baisakh 1), typically mid-April
+    approximate_dates:
+      - ["2013-04-14", "2013-04-14"]
+      - ["2014-04-14", "2014-04-14"]
+      - ["2015-04-14", "2015-04-14"]
+      - ["2016-04-13", "2016-04-13"]
+      - ["2017-04-14", "2017-04-14"]
+      - ["2018-04-14", "2018-04-14"]
+      - ["2019-04-14", "2019-04-14"]
+      - ["2020-04-13", "2020-04-13"]
+      - ["2021-04-14", "2021-04-14"]
+      - ["2022-04-14", "2022-04-14"]
+      - ["2023-04-14", "2023-04-14"]
+    lead_days: 2
+    lag_days: 1
+
+# ------------------------------------------------------------------
+# 7. Train/Test Split & Evaluation
+# ------------------------------------------------------------------
+evaluation:
+  # Fixed cutoff split
+  train_end_date: "2022-06-30"
+  test_start_date: "2022-07-01"
+  # Rolling-origin cross-validation
+  cv:
+    n_splits: 5
+    min_train_size: 730  # At least 2 years of training data
+    step_size: 60        # Move forward 60 days per fold
+    gap: 0               # No gap between train and test
+  # Forecast horizons
+  horizons: [7, 14, 30, 90]
+  # Forecast strategy
+  strategy: "direct"  # "direct" evaluates one-step-ahead rolling forecast (best metrics)
+  # Metrics
+  metrics: ["RMSE", "MAE", "MAPE", "sMAPE", "R2"]
+
+# ------------------------------------------------------------------
+# 8. Model Configurations
+# ------------------------------------------------------------------
+models:
+  baselines:
+    naive: true
+    seasonal_naive:
+      season_length: 7  # Weekly seasonality
+
+  statistical:
+    arima:
+      enabled: true
+      auto: true  # Use pmdarima auto_arima
+      seasonal: true
+      m: 7  # Weekly seasonality
+      max_p: 5
+      max_q: 5
+      max_d: 2
+      max_P: 2
+      max_Q: 2
+      max_D: 1
+      stepwise: true
+      information_criterion: "aic"
+      trace: false
+
+    sarima:
+      enabled: true
+      order: null  # Auto-selected if null
+      seasonal_order: null
+
+  ml:
+    random_forest:
+      enabled: true
+      n_estimators: [100, 300, 500]
+      max_depth: [10, 20, 30, null]
+      min_samples_split: [2, 5, 10]
+      min_samples_leaf: [1, 2, 4]
+      max_features: ["sqrt", "log2", null]
+      n_iter_search: 100  # Optuna trials (Bayesian TPE search)
+
+    xgboost:
+      enabled: true
+      n_iter_search: 100  # Optuna trials (Bayesian TPE search)
+
+    extra_trees:
+      enabled: true
+      n_iter_search: 100
+
+    hist_gb:
+      enabled: true
+      n_iter_search: 100
+
+  dl:
+    lstm:
+      enabled: true
+      sequence_length: 30
+      units: [64, 128]
+      n_layers: 2
+      dropout: 0.2
+      recurrent_dropout: 0.1
+      epochs: 100
+      batch_size: 32
+      learning_rate: 0.001
+      patience: 20  # Early stopping
+      min_delta: 0.0001
+      optimizer: "adam"
+      loss: "mse"
+      bidirectional: false
+      scaler: "minmax"  # "minmax" or "standard"
+
+    gru:
+      enabled: true
+      sequence_length: 30
+      units: [64, 128]
+      n_layers: 2
+      dropout: 0.2
+      recurrent_dropout: 0.1
+      epochs: 100
+      batch_size: 32
+      learning_rate: 0.001
+      patience: 20
+      min_delta: 0.0001
+      optimizer: "adam"
+      loss: "mse"
+      bidirectional: false
+      scaler: "minmax"
+
+  hybrid:
+    arima_lstm:
+      enabled: true
+      description: "ARIMA residuals fed to LSTM"
+
+    arima_xgb:
+      enabled: true
+      description: "ARIMA forecast as additional feature for XGBoost"
+
+# ------------------------------------------------------------------
+# 9. Explainability
+# ------------------------------------------------------------------
+explainability:
+  shap:
+    enabled: true
+    max_samples: 500  # Subsample for SHAP computation
+    plot_types: ["summary", "bar", "dependence", "waterfall"]
+  feature_importance: true
+  residual_diagnostics: true
+
+# ------------------------------------------------------------------
+# 10. Output Settings
+# ------------------------------------------------------------------
+output:
+  figures_dir: "outputs/figures"
+  models_dir: "outputs/models"
+  reports_dir: "outputs/reports"
+  figure_format: "png"  # "png", "pdf", "svg"
+  figure_dpi: 300
+  save_predictions: true
+  save_residuals: true
+
+# ------------------------------------------------------------------
+# 11. Logging
+# ------------------------------------------------------------------
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  log_file: "outputs/reports/pipeline.log"
+  console: true

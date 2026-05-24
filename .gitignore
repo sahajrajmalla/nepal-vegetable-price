@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+meroenv/
+data/
+outputs/
+test.ipynb
+lightning_logs/
+catboost_info/
