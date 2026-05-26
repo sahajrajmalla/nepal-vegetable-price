@@ -33,7 +33,7 @@ import argparse
 
 def main():
     parser = argparse.ArgumentParser(description="Stage 2: Preprocess & Create KVPI")
-    parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--force", action="store_true", help="Force re-processing")
     args = parser.parse_args()
 

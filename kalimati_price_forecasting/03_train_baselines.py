@@ -49,7 +49,7 @@ import argparse
 
 def main():
     parser = argparse.ArgumentParser(description="Stage 3: Baselines & Statistical")
-    parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--skip-eda", action="store_true")
     args = parser.parse_args()
 

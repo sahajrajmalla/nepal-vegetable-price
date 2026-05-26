@@ -47,7 +47,7 @@ import argparse
 
 def main():
     parser = argparse.ArgumentParser(description="Stage 6: Hybrid Models on KVPI")
-    parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--config", type=str, default="configs/default.yaml")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
