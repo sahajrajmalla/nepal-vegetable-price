@@ -1,0 +1,92 @@
+\section{Results and Discussion}
+\label{sec:results}
+
+This section presents a comprehensive evaluation of the 14 individual forecasting models and the proposed Stacking Ensemble meta-learner applied to the Kalimati Vegetable Price Index (KVPI). The models were evaluated over an out-of-sample test period (July 2022 to September 2023) across four distinct forecasting horizons: short-term (7 days), medium-term (14 and 30 days), and long-term (90 days). Performance is quantified using Root Mean Square Error (RMSE), Mean Absolute Error (MAE), Mean Absolute Percentage Error (MAPE), symmetric MAPE (sMAPE), and the Coefficient of Determination ($R^2$).
+
+\subsection{Overall Model Performance}
+
+Table~\ref{tab:rmse_across_horizons} summarises the RMSE of all models across the four forecasting horizons. The results demonstrate a clear hierarchy in predictive capability, with tree-based machine learning models and the Stacking Ensemble consistently outperforming traditional statistical methods, deep learning architectures, and modern transformer-based models (PatchTST).
+
+\begin{table}[htbp]
+\centering
+\caption{Root Mean Square Error (RMSE) across multiple forecasting horizons ($h$). Models are sorted by their performance at the 90-day horizon.}
+\label{tab:rmse_across_horizons}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Model} & \textbf{$h=7$} & \textbf{$h=14$} & \textbf{$h=30$} & \textbf{$h=90$} \\
+\midrule
+\textbf{Stacking Ensemble} & 3.182 & \textbf{2.518} & \textbf{1.888} & \textbf{1.860} \\
+XGBoost & 3.606 & 2.933 & 2.168 & 1.946 \\
+HistGB & 4.200 & 3.485 & 2.542 & 2.095 \\
+ExtraTrees & \textbf{3.091} & 2.635 & 2.021 & 2.222 \\
+GRU & 3.255 & 3.064 & 2.379 & 2.266 \\
+RandomForest & 3.604 & 2.842 & 2.097 & 2.520 \\
+\midrule
+ARIMA-HistGB (Hybrid) & 5.894 & 4.722 & 3.410 & 4.753 \\
+PatchTST (SOTA) & 6.919 & 5.340 & 4.513 & 6.432 \\
+LSTM & 6.794 & 7.129 & 7.614 & 7.541 \\
+Naïve (Baseline) & 7.812 & 5.847 & 4.111 & 7.732 \\
+ARIMA-LSTM (Hybrid) & 6.149 & 4.495 & 3.381 & 9.174 \\
+SARIMA & 5.520 & 4.101 & 3.368 & 9.708 \\
+Auto-ARIMA & 5.521 & 4.102 & 3.373 & 9.717 \\
+Seasonal Naïve (Baseline) & 5.923 & 5.434 & 5.562 & 11.915 \\
+NBEATSx (SOTA) & 9.012 & 11.121 & 15.835 & 25.386 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Short-Term vs. Long-Term Dynamics}
+
+In the extremely short term ($h=7$), the \textit{ExtraTrees Regressor} achieved the lowest RMSE (3.091), slightly edging out the Stacking Ensemble (3.182). This suggests that for highly immediate, reactive forecasts, the variance-reducing property of extremely randomized trees captures high-frequency price fluctuations effectively. 
+
+However, as the forecasting horizon extends to the medium and long term ($h \in \{14, 30, 90\}$), the \textbf{Stacking Ensemble} establishes clear dominance. At $h=90$, the Stacking Ensemble achieved an RMSE of 1.860, representing a 4.46\% improvement over the best individual model (XGBoost, RMSE 1.946). This highlights the meta-learner's ability to selectively weigh the strengths of diverse base learners to maintain stable predictions over longer periods.
+
+\subsection{Detailed Evaluation at 90-Day Horizon}
+
+Table~\ref{tab:detailed_metrics_90} provides a comprehensive breakdown of all evaluation metrics at the 90-day horizon. 
+
+\begin{table}[htbp]
+\centering
+\caption{Detailed evaluation metrics at the long-term forecast horizon ($h=90$).}
+\label{tab:detailed_metrics_90}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Model} & \textbf{RMSE} & \textbf{MAE} & \textbf{MAPE (\%)} & \textbf{sMAPE (\%)} & \textbf{$R^2$} \\
+\midrule
+\textbf{Stacking Ensemble} & \textbf{1.860} & \textbf{1.493} & \textbf{0.784} & \textbf{0.785} & \textbf{0.915} \\
+XGBoost & 1.946 & 1.521 & 0.801 & 0.800 & 0.907 \\
+HistGB & 2.095 & 1.639 & 0.866 & 0.864 & 0.893 \\
+ExtraTrees & 2.222 & 1.806 & 0.948 & 0.951 & 0.879 \\
+GRU & 2.266 & 1.819 & 0.954 & 0.956 & 0.874 \\
+RandomForest & 2.520 & 2.093 & 1.100 & 1.102 & 0.845 \\
+ARIMA-HistGB & 4.753 & 4.061 & 2.116 & 2.136 & 0.447 \\
+PatchTST & 6.432 & 5.298 & 2.747 & 2.780 & -0.013 \\
+LSTM & 7.541 & 7.233 & 3.793 & 3.873 & -0.392 \\
+Auto-ARIMA & 9.717 & 8.040 & 4.140 & 4.258 & -1.311 \\
+Seasonal Naïve & 11.915 & 9.954 & 5.140 & 5.326 & -2.476 \\
+NBEATSx & 25.386 & 24.222 & 12.617 & 11.809 & -14.777 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsubsection{Superiority of Tree-Based ML Models}
+The results strongly validate the efficacy of tree-based ensemble methods (XGBoost, HistGB, ExtraTrees, RandomForest) for agricultural commodity price forecasting. All four models achieved an $R^2 > 0.84$ at the 90-day horizon. XGBoost proved particularly robust ($R^2 = 0.907$, MAPE = 0.801\%), effectively capturing nonlinear price dynamics, complex seasonal interactions, and the impact of the engineered calendar and festival features.
+
+\subsubsection{Limitations of Statistical and Deep Learning Models}
+Traditional statistical models (Auto-ARIMA, SARIMA) performed poorly at extended horizons ($R^2 < 0$), heavily penalised by their inability to incorporate the high-dimensional feature space (e.g., rolling statistics, festival interactions) that the ML models leveraged. 
+
+While the GRU model performed respectably (RMSE 2.266), the LSTM architecture degraded significantly (RMSE 7.541). Furthermore, the state-of-the-art transformer-based model, PatchTST, and the NBEATSx architecture failed to generalise on this dataset, yielding negative $R^2$ values. This underperformance can be attributed to the relatively limited length of the training sequence (~3,300 days) compared to the vast data requirements of modern deep architectures, leading to severe overfitting despite the use of dropout and early stopping.
+
+\subsubsection{Hybrid Model Performance}
+The ARIMA-HistGB hybrid model (RMSE 4.753, $R^2 = 0.447$) significantly outperformed the ARIMA-LSTM hybrid (RMSE 9.174, $R^2 = -1.061$) and the standalone ARIMA model. By augmenting the feature space with ARIMA's in-sample fitted values, the HistGB meta-learner successfully compensated for the linear model's shortcomings, though it still fell short of the pure ML approaches.
+
+\subsection{Stacking Ensemble Dynamic Selection}
+
+The success of the Stacking Ensemble is largely driven by its Dynamic Ensemble Selection (DES) mechanism and inverse-RMSE weighting. During the validation phase (the first 30\% of the test set), the DES filter rigorously excluded models that failed to outperform a mean-predictor baseline ($R^2 \leq 0$). Consequently, poorly performing models like SARIMA, Auto-ARIMA, and the SOTA transformers were dynamically purged from the ensemble.
+
+The final meta-learner (InvRMSE\_Top5) optimally blended the predictions of the top five surviving models: XGBoost (weight: 0.2216), HistGB (0.2089), ExtraTrees (0.2053), RandomForest (0.2030), and GRU (0.1612). This selective combination resulted in the highest overall variance explained ($R^2 = 0.915$) and the lowest absolute error (MAE = 1.493 Rs) across the 90-day horizon, confirming that a carefully curated ensemble of heterogeneous, high-performing base learners yields the most robust agricultural price forecasts.
+
