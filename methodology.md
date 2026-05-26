@@ -48,7 +48,7 @@ $$ \text{KVPI}_t = \frac{\sum_{c \in C_t} w_c \cdot P_{c,t}^{\text{norm}}}{\sum_
 
 The resulting KVPI spans 3,757 days from June 2013 to September 2023, possessing a range of [91.0, 230.1].
 
-![KVPI Price Series](/Users/sahajrajmalla/Documents/nepal-vegetable-price/kalimati_price_forecasting/outputs/figures/kvpi_price_series.png)
+![KVPI Price Series](/Users/sahajrajmalla/Documents/nepal-vegetable-price/kalimati_price_forecasting/outputs/report_figures/01_kvpi_price_series.png)
 
 ## Feature Engineering
 A comprehensive feature matrix of 67 predictors is constructed. All lag-based and rolling features utilise a backward shift of 1 day to strictly prevent data leakage and look-ahead bias.
@@ -62,8 +62,8 @@ A comprehensive feature matrix of 67 predictors is constructed. All lag-based an
 *   **Price-Derived Features (7):** Metrics such as spread, price velocity, 7-day price momentum, acceleration, squared returns (serving as a volatility clustering proxy), and rolling CVs for 7, 14, and 30 days.
 *   **STL Decomposition (3):** Seasonal and Trend decomposition using Loess (STL) applied with a weekly period, extracting trend, seasonal, and residual components.
 
-![KVPI STL Decomposition](/Users/sahajrajmalla/Documents/nepal-vegetable-price/kalimati_price_forecasting/outputs/figures/kvpi_decomposition.png)
-![KVPI Festival Heatmap](/Users/sahajrajmalla/Documents/nepal-vegetable-price/kalimati_price_forecasting/outputs/figures/kvpi_festival_heatmap.png)
+![KVPI STL Decomposition](/Users/sahajrajmalla/Documents/nepal-vegetable-price/kalimati_price_forecasting/outputs/report_figures/02_kvpi_decomposition.png)
+![KVPI Festival Heatmap](/Users/sahajrajmalla/Documents/nepal-vegetable-price/kalimati_price_forecasting/outputs/report_figures/03_kvpi_festival_heatmap.png)
 
 ## Experimental Setup
 
@@ -81,7 +81,7 @@ Full reproducibility is ensured via a global random seed (42) propagated across 
 ### Baseline and Statistical Models
 The baseline models include a Naïve (random-walk) forecast and a Seasonal Naïve forecast (weekly cycle, $m=7$). The statistical models encompass Auto-ARIMA, which identified an ARIMA(2,1,1)×(0,0,0,7) structure via step-wise AIC minimisation, and a manually fitted SARIMA leveraging identical orders via maximum likelihood estimation.
 
-![KVPI ACF PACF](/Users/sahajrajmalla/Documents/nepal-vegetable-price/kalimati_price_forecasting/outputs/figures/kvpi_acf_pacf.png)
+![KVPI ACF PACF](/Users/sahajrajmalla/Documents/nepal-vegetable-price/kalimati_price_forecasting/outputs/report_figures/04_kvpi_acf_pacf.png)
 
 ### Machine Learning Models
 The machine learning models (Random Forest, Extra Trees, Histogram-based Gradient Boosting, and XGBoost) utilise the complete 67-feature set. Hyperparameters were rigorously optimised using Optuna (Tree-structured Parzen Estimator) over 100 trials employing 5-fold TimeSeriesSplit cross-validation. For instance, the optimal XGBoost parameters included 1000 estimators, a maximum depth of 3, and a learning rate of 0.0122.
@@ -97,5 +97,9 @@ Two hybrid architectures based on the Zhang (2003) decomposition framework were 
 ### State-of-the-Art (SOTA) Models
 PatchTST (a transformer-based model) and NBEATSx (neural basis expansion with exogenous variables) were implemented using the NeuralForecast library. They were restricted to 90-step forecasts and evaluated independently from the stacking ensemble due to fixed-length prediction constraints.
 
-### Stacking Ensemble Meta-Learner
-A multi-strategy ensemble approach aggregates predictions from 12 full-length models. A Dynamic Ensemble Selection (DES) mechanism employs the first 30% of the test set (136 days) as a validation set, strictly filtering out any model with $R^2 \le 0$. Of the 12 candidate models, 7 were retained. An inverse-RMSE weighted average of the top 5 models (XGBoost, HistGB, ExtraTrees, RandomForest, and GRU) was selected as the optimal meta-learner strategy following a competitive evaluation of six distinct ensemble methods.
+### Momentum-Corrected Online Stacking Ensemble
+A multi-strategy causal ensemble aggregates predictions to form the final meta-learner. Rather than relying on a static historical blend which is highly susceptible to structural breaks, we implemented a **Momentum-Corrected Online Meta-Learner**.
+
+At time $t$, the ensemble strictly utilizes actual observations up to $t-1$ to compute dynamic bias corrections for the incoming forecast, ensuring zero data leakage. Crucially, the meta-learner computes the **rolling residual derivative** (the slope of recent forecast errors) between the base blend and the true price. If the slope is positive—indicating that the base models are progressively falling further behind the true price—the ensemble adds a momentum penalty proportional to the rate of error growth. 
+
+This forces the meta-learner to aggressively "lean into" upward or downward price spikes, effectively resolving the lagging problem inherent in standard sequence and tree models during periods of high volatility. The final optimal configuration blended the predictions of XGBoost and GRU, combining XGBoost's high-frequency precision with GRU's underlying trend recognition, dynamically corrected by the momentum mechanism.

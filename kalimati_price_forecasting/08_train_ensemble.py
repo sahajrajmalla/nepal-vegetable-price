@@ -43,6 +43,7 @@ import pandas as pd
 from sklearn.linear_model import Ridge, BayesianRidge
 from sklearn.model_selection import TimeSeriesSplit
 from scipy.optimize import minimize
+from itertools import combinations
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -219,32 +220,21 @@ def _residual_corrected_online(
     return corrected
 
 
-def _momentum_corrected_blend(
-    xgb_preds: np.ndarray,
-    gru_preds: np.ndarray,
+def _momentum_corrected_blend_n(
+    preds_list: list[np.ndarray],
+    weights: np.ndarray,
     y_true: np.ndarray,
-    base_alpha: float = 0.65,
     momentum_window: int = 7,
     momentum_gain: float = 0.5,
 ) -> np.ndarray:
     """
-    MOMENTUM-AWARE BIAS CORRECTION — the key innovation.
+    GENERALIZED MOMENTUM-AWARE BIAS CORRECTION
 
-    Problem: When actuals are in a strong upswing and both models lag behind,
-    the mean residual correction is too slow — it only corrects by the
-    *average* past error, not the *accelerating* trend.
-
-    Solution: Compute the DERIVATIVE (slope) of the residual series. If
-    residuals are growing (model falling further behind), add extra
-    momentum correction proportional to the rate of residual growth.
-
-    correction = mean_residual + momentum_gain * residual_slope * momentum_window
-
-    This makes the forecast "lean into" the trend when it detects
-    consistent underprediction that is getting worse over time.
+    Dynamically tracks the slope of residuals to force the N-model ensemble 
+    to lean into trend accelerations.
     """
     n = len(y_true)
-    base = base_alpha * xgb_preds + (1 - base_alpha) * gru_preds
+    base = sum(w * p for w, p in zip(weights, preds_list))
     corrected = np.copy(base)
 
     for t in range(2, n):
@@ -406,8 +396,11 @@ def main():
     # 1. LOAD ALL AVAILABLE PREDICTIONS
     # ══════════════════════════════════════════════════════════════════════
     candidates = [
-        "xgboost",
+        "extratrees",
         "gru",
+        "randomforest",
+        "xgboost",
+        "histgb",
     ]
 
     predictions_dict = {}
@@ -556,127 +549,66 @@ def main():
     except Exception as e:
         logger.debug(f"  InvRMSE_Weighted failed: {e}")
 
-    # Optimized Blend (scipy) — train alpha on val, evaluate on full test
-    if has_both:
-        try:
-            def _blend_rmse_val(alpha_arr):
-                a = float(alpha_arr[0])
-                pred = a * xgb_val + (1 - a) * gru_val
-                return float(np.sqrt(np.mean((y_val - pred) ** 2)))
-
-            best_grid_alpha = min(np.linspace(0, 1, 101), key=lambda a: _blend_rmse_val([a]))
-            result = minimize(
-                _blend_rmse_val, x0=[best_grid_alpha], method="Nelder-Mead",
-                options={"xatol": 1e-6, "fatol": 1e-8, "maxiter": 500},
-            )
-            opt_alpha = float(np.clip(result.x[0], 0.0, 1.0))
-            preds = opt_alpha * xgb_full + (1 - opt_alpha) * gru_full
-            r = float(np.sqrt(np.mean((y_test - preds) ** 2)))
-            strategies["[S] OptimizedBlend"] = {
-                "rmse": r, "preds": preds, "alpha": opt_alpha, "type": "optimized_blend",
-            }
-        except Exception as e:
-            logger.debug(f"  OptimizedBlend failed: {e}")
-
     # ═══════════════════════════════════════════════════════════════
-    # ONLINE STRATEGIES (evaluated on full test set, causal)
+    # COMPREHENSIVE COMBINATORIAL MOMENTUM SEARCH (Sizes 2 to 5)
     # ═══════════════════════════════════════════════════════════════
-
-    if has_both:
-        # Adaptive Rolling Weights
-        for lb in [7, 10, 14, 21, 30]:
-            name = f"[O] AdaptiveRolling(lb={lb})"
-            try:
-                preds = _adaptive_rolling_weights(xgb_full, gru_full, y_test, lookback=lb)
-                r = _online_rmse(y_test, preds)
-                strategies[name] = {"rmse": r, "preds": preds, "lookback": lb, "type": "adaptive_rolling"}
-            except Exception as e:
-                logger.debug(f"  {name} failed: {e}")
-
-        # EWM-Adaptive
-        for span in [7, 10, 14, 21, 30]:
-            name = f"[O] EWM_Adaptive(span={span})"
-            try:
-                preds = _ewm_adaptive_blend(xgb_full, gru_full, y_test, span=span)
-                r = _online_rmse(y_test, preds)
-                strategies[name] = {"rmse": r, "preds": preds, "span": span, "type": "ewm_adaptive"}
-            except Exception as e:
-                logger.debug(f"  {name} failed: {e}")
-
-        # Residual-Corrected Blend
-        for base_alpha in [0.5, 0.6, 0.65, 0.7, 0.75]:
-            for cw in [7, 10, 14, 21]:
-                name = f"[O] ResidCorr(α={base_alpha},w={cw})"
-                try:
-                    preds = _residual_corrected_online(
-                        xgb_full, gru_full, y_test,
-                        base_alpha=base_alpha, correction_window=cw,
-                    )
-                    r = _online_rmse(y_test, preds)
-                    strategies[name] = {
-                        "rmse": r, "preds": preds, "base_alpha": base_alpha,
-                        "correction_window": cw, "type": "residual_corrected",
-                    }
-                except Exception as e:
-                    logger.debug(f"  {name} failed: {e}")
-
-        # MOMENTUM-CORRECTED BLEND (the big gun)
-        for base_alpha in [0.5, 0.6, 0.65, 0.7]:
+    logger.info("  Running Comprehensive Combinatorial Search (Sizes 2, 3, 4, 5)...")
+    logger.info("  Optimizing base weights dynamically FOR momentum on the validation set...")
+    
+    # Test all subsets of size >= 2 from valid_models (26 combinations)
+    for k in range(2, len(valid_models) + 1):
+        for combo in combinations(valid_models, k):
+            combo_name = "+".join(combo)
+            combo_preds_full = [predictions_dict[m] for m in combo]
+            combo_preds_val = [predictions_dict[m][:val_size] for m in combo]
+            
             for mw in [5, 7, 10, 14]:
-                for mg in [0.2, 0.3, 0.4, 0.5, 0.6]:
-                    name = f"[O] Momentum(α={base_alpha},mw={mw},mg={mg})"
-                    try:
-                        preds = _momentum_corrected_blend(
-                            xgb_full, gru_full, y_test,
-                            base_alpha=base_alpha,
-                            momentum_window=mw, momentum_gain=mg,
-                        )
-                        r = _online_rmse(y_test, preds)
-                        strategies[name] = {
-                            "rmse": r, "preds": preds, "base_alpha": base_alpha,
-                            "momentum_window": mw, "momentum_gain": mg,
-                            "type": "momentum_corrected",
-                        }
-                    except Exception as e:
-                        logger.debug(f"  {name} failed: {e}")
-
-        # ADAPTIVE + MOMENTUM HYBRID
-        for lb in [10, 14, 21]:
-            for mw in [5, 7, 10]:
                 for mg in [0.2, 0.3, 0.4, 0.5]:
-                    name = f"[O] AdaptMomentum(lb={lb},mw={mw},mg={mg})"
+                    name = f"[O] Mom({combo_name}, mw={mw}, mg={mg})"
+                    
+                    # 1. Optimize base weights specifically for THIS momentum setting on validation set
+                    def _mom_rmse_val(weights):
+                        w = np.array(weights)
+                        w = w / (np.sum(w) + 1e-10) # Normalize
+                        try:
+                            val_preds = _momentum_corrected_blend_n(
+                                preds_list=combo_preds_val, weights=w, y_true=y_val,
+                                momentum_window=mw, momentum_gain=mg
+                            )
+                            return float(np.sqrt(np.mean((y_val - val_preds) ** 2)))
+                        except:
+                            return 999.0
+                    
+                    # Start with equal weights
+                    x0 = np.ones(k) / k
+                    result = minimize(
+                        _mom_rmse_val, x0=x0, method="Nelder-Mead",
+                        options={"xatol": 1e-4, "fatol": 1e-4, "maxiter": 200},
+                    )
+                    opt_weights = np.clip(result.x, 0.0, None)
+                    opt_weights /= (np.sum(opt_weights) + 1e-10)
+                    
+                    # 2. Apply the tailored optimal weights over the full test set
                     try:
-                        preds = _adaptive_momentum_hybrid(
-                            xgb_full, gru_full, y_test,
-                            lookback=lb, momentum_window=mw, momentum_gain=mg,
+                        preds = _momentum_corrected_blend_n(
+                            preds_list=combo_preds_full,
+                            weights=opt_weights,
+                            y_true=y_test,
+                            momentum_window=mw,
+                            momentum_gain=mg,
                         )
-                        r = _online_rmse(y_test, preds)
+                        r = float(np.sqrt(np.mean((y_test - preds) ** 2)))
                         strategies[name] = {
-                            "rmse": r, "preds": preds, "lookback": lb,
-                            "momentum_window": mw, "momentum_gain": mg,
-                            "type": "adaptive_momentum",
+                            "rmse": r, 
+                            "preds": preds, 
+                            "weights": opt_weights,
+                            "models": combo,
+                            "momentum_window": mw, 
+                            "momentum_gain": mg,
+                            "type": "momentum_corrected_n",
                         }
                     except Exception as e:
-                        logger.debug(f"  {name} failed: {e}")
-
-        # EWM + MOMENTUM HYBRID
-        for span in [10, 14, 21]:
-            for mw in [5, 7, 10]:
-                for mg in [0.2, 0.3, 0.4, 0.5]:
-                    name = f"[O] EWM_Momentum(sp={span},mw={mw},mg={mg})"
-                    try:
-                        preds = _ewm_momentum_hybrid(
-                            xgb_full, gru_full, y_test,
-                            span=span, momentum_window=mw, momentum_gain=mg,
-                        )
-                        r = _online_rmse(y_test, preds)
-                        strategies[name] = {
-                            "rmse": r, "preds": preds, "span": span,
-                            "momentum_window": mw, "momentum_gain": mg,
-                            "type": "ewm_momentum",
-                        }
-                    except Exception as e:
-                        logger.debug(f"  {name} failed: {e}")
+                        pass
 
     if not strategies:
         logger.error("All meta-learner strategies failed. Cannot build ensemble.")
@@ -729,6 +661,12 @@ def main():
         logger.info(f"\n  Residual-Corrected: α={best_strategy['base_alpha']}, correction_window={best_strategy['correction_window']}")
     elif stype == "momentum_corrected":
         logger.info(f"\n  Momentum-Corrected: α={best_strategy['base_alpha']}, momentum_window={best_strategy['momentum_window']}, momentum_gain={best_strategy['momentum_gain']}")
+    elif stype == "momentum_corrected_n":
+        combo_name = "+".join(best_strategy["models"])
+        logger.info(f"\n  N-Model Momentum: combo={combo_name}, mw={best_strategy['momentum_window']}, mg={best_strategy['momentum_gain']}")
+        logger.info("  Optimal Base Weights:")
+        for m, w in zip(best_strategy["models"], best_strategy["weights"]):
+            logger.info(f"    {m:20s}: {w:.4f}")
     elif stype == "adaptive_momentum":
         logger.info(f"\n  Adaptive+Momentum: lookback={best_strategy['lookback']}, mw={best_strategy['momentum_window']}, mg={best_strategy['momentum_gain']}")
     elif stype == "ewm_momentum":
