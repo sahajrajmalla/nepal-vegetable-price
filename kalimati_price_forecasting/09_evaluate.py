@@ -149,10 +149,10 @@ def main():
             logger.info("─" * 60)
             
             h = min(cfg["evaluation"]["horizons"])
-            res = diebold_mariano_test(actual[:n_min], base_pred[:n_min], ens_pred[:n_min], h=h, loss_type="MSE")
-            logger.info(f"DM Statistic: {res['DM_statistic']:.4f}")
-            logger.info(f"p-value     : {res['p_value']:.4e}")
-            if res['p_value'] < 0.05:
+            res = diebold_mariano_test(actual[:n_min], base_pred[:n_min], ens_pred[:n_min], horizon=h, loss="squared")
+            logger.info(f"DM Statistic: {res['dm_stat']:.4f}")
+            logger.info(f"p-value     : {res['dm_pvalue']:.4e}")
+            if res['dm_pvalue'] < 0.05:
                 logger.info("Conclusion  : The difference in accuracy is statistically significant (p < 0.05).")
             else:
                 logger.info("Conclusion  : The difference in accuracy is not statistically significant.")
@@ -160,8 +160,8 @@ def main():
             with open(md_path, "a", encoding="utf-8") as f:
                 f.write("\n## Statistical Significance (Diebold-Mariano Test)\n\n")
                 f.write("Comparing StackingEnsemble vs HistGB:\n")
-                f.write(f"- **DM Statistic**: {res['DM_statistic']:.4f}\n")
-                f.write(f"- **p-value**: {res['p_value']:.4e}\n")
+                f.write(f"- **DM Statistic**: {res['dm_stat']:.4f}\n")
+                f.write(f"- **p-value**: {res['dm_pvalue']:.4e}\n")
     except Exception as e:
         logger.warning(f"Failed to run Diebold-Mariano test: {e}")
 

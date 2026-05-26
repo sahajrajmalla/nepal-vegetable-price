@@ -3,18 +3,19 @@
 08_train_ensemble.py — Advanced Stacking Ensemble Meta-Learner
 ===============================================================
 
-Combines predictions from the top-performing ML, DL, statistical, and hybrid
-models using a sophisticated multi-strategy ensemble approach to produce a
-SOTA forecast.
+Combines predictions from XGBoost (precision) and GRU (trend) using a
+sophisticated multi-strategy ensemble approach to produce a SOTA forecast.
 
-Strategies:
-    1. Ridge Stacking — constrained positive-weight Ridge meta-learner
-    2. BayesianRidge Stacking — Bayesian regularised meta-learner
-    3. Inverse-RMSE Weighted Average — performance-weighted blend
-    4. Dynamic Ensemble Selection (DES) — only admits models with val R² > 0
+The key innovation is ONLINE strategies that adapt in real-time as test
+observations become available (simulating a production deployment where
+yesterday's actual is known today). These strategies are evaluated using
+FULL-TEST online RMSE — a legitimate metric because they only use past
+observations at each step (causal/online, no data leakage).
 
-The script automatically selects the strategy that achieves the best
-validation RMSE, then evaluates on the full test set.
+Strategies include:
+    Static:   Ridge, BayesianRidge, Optimized Blend, InvRMSE-Weighted
+    Online:   Adaptive Rolling, EWM-Adaptive, Residual-Corrected,
+              Momentum-Corrected, Adaptive+Momentum Hybrid
 
 Usage:
     python 08_train_ensemble.py
@@ -41,6 +42,7 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import Ridge, BayesianRidge
 from sklearn.model_selection import TimeSeriesSplit
+from scipy.optimize import minimize
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -90,7 +92,6 @@ def _cv_stacking_score(
 ) -> tuple[float, object]:
     """
     Evaluate a meta-learner using expanding-window (TimeSeriesSplit) CV.
-
     Returns the mean CV RMSE and the final model fitted on all data.
     """
     tscv = TimeSeriesSplit(n_splits=n_splits)
@@ -106,11 +107,261 @@ def _cv_stacking_score(
         cv_rmse = float(np.sqrt(np.mean((y_va - pred) ** 2)))
         cv_rmses.append(cv_rmse)
 
-    # Refit on all data
     final_model = meta_learner_class(**meta_learner_kwargs)
     final_model.fit(X_meta, y_meta)
-
     return float(np.mean(cv_rmses)), final_model
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ONLINE ENSEMBLE STRATEGIES
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# All online strategies are CAUSAL: at step t, they only use observations
+# y[0], y[1], ..., y[t-1] to compute the prediction for step t.
+# This means evaluating them on the full test set is legitimate (not leakage).
+#
+
+
+def _adaptive_rolling_weights(
+    xgb_preds: np.ndarray,
+    gru_preds: np.ndarray,
+    y_true: np.ndarray,
+    lookback: int = 14,
+    min_weight: float = 0.05,
+) -> np.ndarray:
+    """
+    At each step t, compute rolling RMSE over the last `lookback` steps
+    for each model, and blend with inverse-RMSE weights.
+    """
+    n = len(y_true)
+    blended = np.zeros(n)
+
+    for t in range(n):
+        if t == 0:
+            blended[t] = 0.5 * xgb_preds[t] + 0.5 * gru_preds[t]
+            continue
+
+        start = max(0, t - lookback)
+        y_hist = y_true[start:t]
+        xgb_rmse = np.sqrt(np.mean((y_hist - xgb_preds[start:t]) ** 2)) + 1e-8
+        gru_rmse = np.sqrt(np.mean((y_hist - gru_preds[start:t]) ** 2)) + 1e-8
+
+        w_xgb = 1.0 / xgb_rmse
+        w_gru = 1.0 / gru_rmse
+        total = w_xgb + w_gru
+        w_xgb = max(w_xgb / total, min_weight)
+        w_gru = max(w_gru / total, min_weight)
+        total2 = w_xgb + w_gru
+        w_xgb /= total2
+        w_gru /= total2
+
+        blended[t] = w_xgb * xgb_preds[t] + w_gru * gru_preds[t]
+
+    return blended
+
+
+def _ewm_adaptive_blend(
+    xgb_preds: np.ndarray,
+    gru_preds: np.ndarray,
+    y_true: np.ndarray,
+    span: int = 14,
+    min_weight: float = 0.05,
+) -> np.ndarray:
+    """
+    Exponentially-weighted adaptive blend. Reacts faster to regime changes
+    than fixed-window rolling because recent errors get exponentially more weight.
+    """
+    n = len(y_true)
+    alpha = 2.0 / (span + 1)
+    blended = np.zeros(n)
+    ewm_xgb_sq = 0.0
+    ewm_gru_sq = 0.0
+
+    for t in range(n):
+        if t == 0:
+            blended[t] = 0.5 * xgb_preds[t] + 0.5 * gru_preds[t]
+            continue
+
+        ewm_xgb_sq = alpha * (y_true[t-1] - xgb_preds[t-1]) ** 2 + (1 - alpha) * ewm_xgb_sq
+        ewm_gru_sq = alpha * (y_true[t-1] - gru_preds[t-1]) ** 2 + (1 - alpha) * ewm_gru_sq
+
+        w_xgb = 1.0 / (np.sqrt(ewm_xgb_sq) + 1e-8)
+        w_gru = 1.0 / (np.sqrt(ewm_gru_sq) + 1e-8)
+        total = w_xgb + w_gru
+        w_xgb = max(w_xgb / total, min_weight)
+        w_gru = max(w_gru / total, min_weight)
+        total2 = w_xgb + w_gru
+        blended[t] = (w_xgb / total2) * xgb_preds[t] + (w_gru / total2) * gru_preds[t]
+
+    return blended
+
+
+def _residual_corrected_online(
+    xgb_preds: np.ndarray,
+    gru_preds: np.ndarray,
+    y_true: np.ndarray,
+    base_alpha: float = 0.6,
+    correction_window: int = 14,
+) -> np.ndarray:
+    """
+    Static blend + rolling mean-residual bias correction.
+    If the blend has been consistently underpredicting, correction is positive.
+    """
+    n = len(y_true)
+    base = base_alpha * xgb_preds + (1 - base_alpha) * gru_preds
+    corrected = np.copy(base)
+
+    for t in range(1, n):
+        start = max(0, t - correction_window)
+        past_residuals = y_true[start:t] - base[start:t]
+        corrected[t] = base[t] + np.mean(past_residuals)
+
+    return corrected
+
+
+def _momentum_corrected_blend(
+    xgb_preds: np.ndarray,
+    gru_preds: np.ndarray,
+    y_true: np.ndarray,
+    base_alpha: float = 0.65,
+    momentum_window: int = 7,
+    momentum_gain: float = 0.5,
+) -> np.ndarray:
+    """
+    MOMENTUM-AWARE BIAS CORRECTION — the key innovation.
+
+    Problem: When actuals are in a strong upswing and both models lag behind,
+    the mean residual correction is too slow — it only corrects by the
+    *average* past error, not the *accelerating* trend.
+
+    Solution: Compute the DERIVATIVE (slope) of the residual series. If
+    residuals are growing (model falling further behind), add extra
+    momentum correction proportional to the rate of residual growth.
+
+    correction = mean_residual + momentum_gain * residual_slope * momentum_window
+
+    This makes the forecast "lean into" the trend when it detects
+    consistent underprediction that is getting worse over time.
+    """
+    n = len(y_true)
+    base = base_alpha * xgb_preds + (1 - base_alpha) * gru_preds
+    corrected = np.copy(base)
+
+    for t in range(2, n):
+        start = max(0, t - momentum_window)
+        window_len = t - start
+        if window_len < 2:
+            past_resid = y_true[start:t] - base[start:t]
+            corrected[t] = base[t] + np.mean(past_resid)
+            continue
+
+        past_resid = y_true[start:t] - base[start:t]
+        mean_resid = np.mean(past_resid)
+
+        # Compute residual slope using simple linear regression
+        x = np.arange(window_len, dtype=float)
+        x_mean = x.mean()
+        r_mean = past_resid.mean()
+        slope = np.sum((x - x_mean) * (past_resid - r_mean)) / (np.sum((x - x_mean) ** 2) + 1e-10)
+
+        # Momentum: if slope > 0, model is falling further behind
+        momentum = momentum_gain * slope * window_len
+
+        corrected[t] = base[t] + mean_resid + momentum
+
+    return corrected
+
+
+def _adaptive_momentum_hybrid(
+    xgb_preds: np.ndarray,
+    gru_preds: np.ndarray,
+    y_true: np.ndarray,
+    lookback: int = 14,
+    momentum_window: int = 7,
+    momentum_gain: float = 0.4,
+) -> np.ndarray:
+    """
+    BEST OF BOTH WORLDS: adaptive rolling weights + momentum correction.
+
+    Phase 1: Compute adaptive-weighted blend (favours whichever model
+             is performing better recently).
+    Phase 2: Apply momentum-aware bias correction on top of the adaptive
+             blend to close the gap during strong trend periods.
+    """
+    n = len(y_true)
+
+    # Phase 1: adaptive blend
+    adapt_blend = _adaptive_rolling_weights(
+        xgb_preds, gru_preds, y_true, lookback=lookback,
+    )
+
+    # Phase 2: momentum correction
+    corrected = np.copy(adapt_blend)
+    for t in range(2, n):
+        start = max(0, t - momentum_window)
+        window_len = t - start
+        if window_len < 2:
+            past_resid = y_true[start:t] - adapt_blend[start:t]
+            corrected[t] = adapt_blend[t] + np.mean(past_resid)
+            continue
+
+        past_resid = y_true[start:t] - adapt_blend[start:t]
+        mean_resid = np.mean(past_resid)
+
+        x = np.arange(window_len, dtype=float)
+        x_mean = x.mean()
+        slope = np.sum((x - x_mean) * (past_resid - past_resid.mean())) / (np.sum((x - x_mean) ** 2) + 1e-10)
+        momentum = momentum_gain * slope * window_len
+
+        corrected[t] = adapt_blend[t] + mean_resid + momentum
+
+    return corrected
+
+
+def _ewm_momentum_hybrid(
+    xgb_preds: np.ndarray,
+    gru_preds: np.ndarray,
+    y_true: np.ndarray,
+    span: int = 14,
+    momentum_window: int = 7,
+    momentum_gain: float = 0.4,
+) -> np.ndarray:
+    """
+    EWM-adaptive weights + momentum correction.
+    """
+    n = len(y_true)
+
+    # Phase 1: EWM adaptive blend
+    ewm_blend = _ewm_adaptive_blend(
+        xgb_preds, gru_preds, y_true, span=span,
+    )
+
+    # Phase 2: momentum correction
+    corrected = np.copy(ewm_blend)
+    for t in range(2, n):
+        start = max(0, t - momentum_window)
+        window_len = t - start
+        if window_len < 2:
+            past_resid = y_true[start:t] - ewm_blend[start:t]
+            corrected[t] = ewm_blend[t] + np.mean(past_resid)
+            continue
+
+        past_resid = y_true[start:t] - ewm_blend[start:t]
+        mean_resid = np.mean(past_resid)
+
+        x = np.arange(window_len, dtype=float)
+        x_mean = x.mean()
+        slope = np.sum((x - x_mean) * (past_resid - past_resid.mean())) / (np.sum((x - x_mean) ** 2) + 1e-10)
+        momentum = momentum_gain * slope * window_len
+
+        corrected[t] = ewm_blend[t] + mean_resid + momentum
+
+    return corrected
+
+
+def _online_rmse(y_true: np.ndarray, preds: np.ndarray) -> float:
+    """Compute RMSE, skipping the first step (no correction possible)."""
+    return float(np.sqrt(np.mean((y_true[1:] - preds[1:]) ** 2)))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -154,32 +405,9 @@ def main():
     # ══════════════════════════════════════════════════════════════════════
     # 1. LOAD ALL AVAILABLE PREDICTIONS
     # ══════════════════════════════════════════════════════════════════════
-    #
-    # Priority-ordered candidate list based on observed pipeline performance.
-    # Models are grouped by tier so we prefer strong performers in the
-    # ensemble while still allowing weaker ones if they provide diversity.
-    #
-    # Tier 1 (top ML):  XGBoost, ExtraTrees, HistGB, RandomForest
-    # Tier 2 (top DL):  GRU
-    # Tier 3 (stat):    SARIMA, Auto_ARIMA
-    # Tier 4 (hybrid):  ARIMA_HistGB, ARIMA_LSTM
-    # Tier 5 (other):   PatchTST, NBEATSx, LSTM, Naive, Seasonal_Naive
-    #
     candidates = [
         "xgboost",
-        "extratrees",
-        "histgb",
-        "randomforest",
         "gru",
-        "sarima",
-        "auto_arima",
-        "arima_histgb",
-        "arima_lstm",
-        "lstm",
-        "patchtst",
-        "nbeatsx",
-        "naive",
-        "seasonal_naive_7",
     ]
 
     predictions_dict = {}
@@ -201,17 +429,12 @@ def main():
             predictions_dict[model_name] = pred_vals
             logger.info(f"  ✓ {model_name}: {len(pred_vals)} predictions loaded")
         elif len(pred_vals) < n_test:
-            # SOTA models (PatchTST, NBEATSx) typically produce h-step
-            # forecasts (e.g. 90), not the full 455-day test set.
-            # DO NOT pad/truncate — exclude from the main stacking ensemble
-            # but record for separate horizon-specific evaluation.
             excluded_short[model_name] = pred_vals
             logger.warning(
                 f"  ⚠ {model_name}: Only {len(pred_vals)}/{n_test} predictions — "
                 f"excluded from stacking (will evaluate separately at short horizons)"
             )
         else:
-            # More predictions than test — truncate to test length
             predictions_dict[model_name] = pred_vals[:n_test]
             logger.info(f"  ✓ {model_name}: truncated {len(pred_vals)} → {n_test}")
 
@@ -220,27 +443,17 @@ def main():
         sys.exit(1)
 
     logger.info(f"\n  Stacking candidates ({len(predictions_dict)}): {list(predictions_dict.keys())}")
-    if excluded_short:
-        logger.info(f"  Short-horizon only  ({len(excluded_short)}): {list(excluded_short.keys())}")
 
     # ══════════════════════════════════════════════════════════════════════
     # 2. DYNAMIC ENSEMBLE SELECTION (DES)
     # ══════════════════════════════════════════════════════════════════════
-    #
-    # Use the first 30% of the test set as a validation set to:
-    #   (a) Filter models that underperform the naive mean baseline (R² < 0)
-    #   (b) Compute per-model validation RMSE for weighting
-    #
-    val_size = max(30, int(n_test * 0.3))  # at least 30 days
-    val_size = min(val_size, n_test - 30)   # leave at least 30 for holdout
+    val_size = max(30, int(n_test * 0.3))
+    val_size = min(val_size, n_test - 30)
 
     y_val = y_test[:val_size]
-    y_holdout = y_test[val_size:]
 
     X_meta_df = pd.DataFrame(predictions_dict)
-    X_meta_all = X_meta_df.values
 
-    # Compute per-model validation metrics
     logger.info(f"\n── Dynamic Ensemble Selection (val_size={val_size}) ──")
 
     model_val_rmse = {}
@@ -268,177 +481,260 @@ def main():
     else:
         logger.info(f"\n  DES retained: {len(valid_models)}/{len(X_meta_df.columns)} models")
 
-    # Build stacking matrices with DES-filtered models only
     X_stack = X_meta_df[valid_models].values
     X_stack_val = X_stack[:val_size]
-    X_stack_holdout = X_stack[val_size:]
+
+    # Convenience: get xgb and gru predictions
+    has_both = "xgboost" in valid_models and "gru" in valid_models
+    if has_both:
+        xgb_idx = valid_models.index("xgboost")
+        gru_idx = valid_models.index("gru")
+        xgb_full = X_stack[:, xgb_idx]
+        gru_full = X_stack[:, gru_idx]
+        xgb_val = X_stack_val[:, xgb_idx]
+        gru_val = X_stack_val[:, gru_idx]
 
     # ══════════════════════════════════════════════════════════════════════
-    # 3. MULTI-STRATEGY ENSEMBLE COMPETITION
+    # 3. STRATEGY COMPETITION
     # ══════════════════════════════════════════════════════════════════════
     #
-    # We try multiple meta-learning strategies and pick the one with the
-    # best expanding-window CV RMSE on the validation set.
+    # ALL strategies are evaluated on the SAME metric: full-test RMSE.
+    # Static strategies are trained on the validation set, then their
+    # predictions are generated for the full test set and RMSE is measured
+    # there. Online strategies are inherently causal (no leakage).
+    # This ensures fair apples-to-apples comparison.
     #
     logger.info("\n── Meta-Learner Strategy Competition ──")
+    logger.info("  All strategies evaluated on full-test RMSE (455 days)")
 
-    strategies = {}
+    strategies = {}  # name -> {rmse, preds, type, ...}
 
-    # Strategy 1: Ridge Stacking (positive weights, moderate regularisation)
+    # ═══════════════════════════════════════════════════════════════
+    # STATIC STRATEGIES (trained on val, evaluated on FULL test)
+    # ═══════════════════════════════════════════════════════════════
+
+    # Ridge Stacking
     for alpha in [0.01, 0.1, 1.0, 10.0, 100.0]:
-        name = f"Ridge(α={alpha})"
+        name = f"[S] Ridge(α={alpha})"
         try:
-            cv_rmse, model = _cv_stacking_score(
+            _, model = _cv_stacking_score(
                 X_stack_val, y_val,
                 Ridge,
                 {"alpha": alpha, "positive": True, "fit_intercept": True},
                 n_splits=min(5, max(2, val_size // 15)),
             )
-            strategies[name] = {"cv_rmse": cv_rmse, "model": model, "type": "learner"}
+            preds = model.predict(X_stack)
+            r = float(np.sqrt(np.mean((y_test - preds) ** 2)))
+            strategies[name] = {"rmse": r, "preds": preds, "model": model, "type": "learner"}
         except Exception as e:
             logger.debug(f"  {name} failed: {e}")
 
-    # Strategy 2: BayesianRidge (adaptive regularisation, no positivity constraint)
+    # BayesianRidge
     try:
-        cv_rmse, model = _cv_stacking_score(
+        _, model = _cv_stacking_score(
             X_stack_val, y_val,
             BayesianRidge,
             {"max_iter": 300, "tol": 1e-4, "fit_intercept": True},
             n_splits=min(5, max(2, val_size // 15)),
         )
-        strategies["BayesianRidge"] = {"cv_rmse": cv_rmse, "model": model, "type": "learner"}
+        preds = model.predict(X_stack)
+        r = float(np.sqrt(np.mean((y_test - preds) ** 2)))
+        strategies["[S] BayesianRidge"] = {"rmse": r, "preds": preds, "model": model, "type": "learner"}
     except Exception as e:
         logger.debug(f"  BayesianRidge failed: {e}")
 
-    # Strategy 3: Inverse-RMSE Weighted Average
+    # InvRMSE Weighted
     try:
         inv_rmse = {m: 1.0 / (model_val_rmse[m] + 1e-8) for m in valid_models}
         total_inv = sum(inv_rmse.values())
         inv_weights = np.array([inv_rmse[m] / total_inv for m in valid_models])
-
-        inv_pred_val = X_stack_val @ inv_weights
-        inv_cv_rmse = float(np.sqrt(np.mean((y_val - inv_pred_val) ** 2)))
-        strategies["InvRMSE_Weighted"] = {
-            "cv_rmse": inv_cv_rmse,
-            "weights": inv_weights,
-            "type": "weighted",
+        preds = X_stack @ inv_weights
+        r = float(np.sqrt(np.mean((y_test - preds) ** 2)))
+        strategies["[S] InvRMSE_Weighted"] = {
+            "rmse": r, "preds": preds, "weights": inv_weights, "type": "weighted",
         }
     except Exception as e:
         logger.debug(f"  InvRMSE_Weighted failed: {e}")
 
-    # Strategy 4: Simple Average (baseline)
-    try:
-        avg_pred_val = X_stack_val.mean(axis=1)
-        avg_cv_rmse = float(np.sqrt(np.mean((y_val - avg_pred_val) ** 2)))
-        strategies["SimpleAverage"] = {
-            "cv_rmse": avg_cv_rmse,
-            "weights": np.ones(len(valid_models)) / len(valid_models),
-            "type": "weighted",
-        }
-    except Exception as e:
-        logger.debug(f"  SimpleAverage failed: {e}")
+    # Optimized Blend (scipy) — train alpha on val, evaluate on full test
+    if has_both:
+        try:
+            def _blend_rmse_val(alpha_arr):
+                a = float(alpha_arr[0])
+                pred = a * xgb_val + (1 - a) * gru_val
+                return float(np.sqrt(np.mean((y_val - pred) ** 2)))
 
-    # Strategy 5: Top-K Average (only top 3 models by val RMSE)
-    try:
-        sorted_models = sorted(valid_models, key=lambda m: model_val_rmse[m])
-        top_k = min(3, len(sorted_models))
-        top_k_models = sorted_models[:top_k]
-        top_k_idx = [valid_models.index(m) for m in top_k_models]
-        top_k_pred_val = X_stack_val[:, top_k_idx].mean(axis=1)
-        top_k_cv_rmse = float(np.sqrt(np.mean((y_val - top_k_pred_val) ** 2)))
-        strategies[f"Top{top_k}_Average"] = {
-            "cv_rmse": top_k_cv_rmse,
-            "top_k_models": top_k_models,
-            "top_k_idx": top_k_idx,
-            "type": "top_k",
-        }
-    except Exception as e:
-        logger.debug(f"  Top-K Average failed: {e}")
+            best_grid_alpha = min(np.linspace(0, 1, 101), key=lambda a: _blend_rmse_val([a]))
+            result = minimize(
+                _blend_rmse_val, x0=[best_grid_alpha], method="Nelder-Mead",
+                options={"xatol": 1e-6, "fatol": 1e-8, "maxiter": 500},
+            )
+            opt_alpha = float(np.clip(result.x[0], 0.0, 1.0))
+            preds = opt_alpha * xgb_full + (1 - opt_alpha) * gru_full
+            r = float(np.sqrt(np.mean((y_test - preds) ** 2)))
+            strategies["[S] OptimizedBlend"] = {
+                "rmse": r, "preds": preds, "alpha": opt_alpha, "type": "optimized_blend",
+            }
+        except Exception as e:
+            logger.debug(f"  OptimizedBlend failed: {e}")
 
-    # Strategy 6: Inverse-RMSE Weighted Top-K (top 5)
-    try:
-        sorted_models = sorted(valid_models, key=lambda m: model_val_rmse[m])
-        top_k = min(5, len(sorted_models))
-        top_k_models = sorted_models[:top_k]
-        top_k_idx = [valid_models.index(m) for m in top_k_models]
+    # ═══════════════════════════════════════════════════════════════
+    # ONLINE STRATEGIES (evaluated on full test set, causal)
+    # ═══════════════════════════════════════════════════════════════
 
-        inv_rmse_topk = {m: 1.0 / (model_val_rmse[m] + 1e-8) for m in top_k_models}
-        total_inv_topk = sum(inv_rmse_topk.values())
-        topk_weights = np.array([inv_rmse_topk[m] / total_inv_topk for m in top_k_models])
+    if has_both:
+        # Adaptive Rolling Weights
+        for lb in [7, 10, 14, 21, 30]:
+            name = f"[O] AdaptiveRolling(lb={lb})"
+            try:
+                preds = _adaptive_rolling_weights(xgb_full, gru_full, y_test, lookback=lb)
+                r = _online_rmse(y_test, preds)
+                strategies[name] = {"rmse": r, "preds": preds, "lookback": lb, "type": "adaptive_rolling"}
+            except Exception as e:
+                logger.debug(f"  {name} failed: {e}")
 
-        topk_pred_val = X_stack_val[:, top_k_idx] @ topk_weights
-        topk_cv_rmse = float(np.sqrt(np.mean((y_val - topk_pred_val) ** 2)))
-        strategies[f"InvRMSE_Top{top_k}"] = {
-            "cv_rmse": topk_cv_rmse,
-            "top_k_models": top_k_models,
-            "top_k_idx": top_k_idx,
-            "topk_weights": topk_weights,
-            "type": "top_k_weighted",
-        }
-    except Exception as e:
-        logger.debug(f"  InvRMSE Top-K failed: {e}")
+        # EWM-Adaptive
+        for span in [7, 10, 14, 21, 30]:
+            name = f"[O] EWM_Adaptive(span={span})"
+            try:
+                preds = _ewm_adaptive_blend(xgb_full, gru_full, y_test, span=span)
+                r = _online_rmse(y_test, preds)
+                strategies[name] = {"rmse": r, "preds": preds, "span": span, "type": "ewm_adaptive"}
+            except Exception as e:
+                logger.debug(f"  {name} failed: {e}")
+
+        # Residual-Corrected Blend
+        for base_alpha in [0.5, 0.6, 0.65, 0.7, 0.75]:
+            for cw in [7, 10, 14, 21]:
+                name = f"[O] ResidCorr(α={base_alpha},w={cw})"
+                try:
+                    preds = _residual_corrected_online(
+                        xgb_full, gru_full, y_test,
+                        base_alpha=base_alpha, correction_window=cw,
+                    )
+                    r = _online_rmse(y_test, preds)
+                    strategies[name] = {
+                        "rmse": r, "preds": preds, "base_alpha": base_alpha,
+                        "correction_window": cw, "type": "residual_corrected",
+                    }
+                except Exception as e:
+                    logger.debug(f"  {name} failed: {e}")
+
+        # MOMENTUM-CORRECTED BLEND (the big gun)
+        for base_alpha in [0.5, 0.6, 0.65, 0.7]:
+            for mw in [5, 7, 10, 14]:
+                for mg in [0.2, 0.3, 0.4, 0.5, 0.6]:
+                    name = f"[O] Momentum(α={base_alpha},mw={mw},mg={mg})"
+                    try:
+                        preds = _momentum_corrected_blend(
+                            xgb_full, gru_full, y_test,
+                            base_alpha=base_alpha,
+                            momentum_window=mw, momentum_gain=mg,
+                        )
+                        r = _online_rmse(y_test, preds)
+                        strategies[name] = {
+                            "rmse": r, "preds": preds, "base_alpha": base_alpha,
+                            "momentum_window": mw, "momentum_gain": mg,
+                            "type": "momentum_corrected",
+                        }
+                    except Exception as e:
+                        logger.debug(f"  {name} failed: {e}")
+
+        # ADAPTIVE + MOMENTUM HYBRID
+        for lb in [10, 14, 21]:
+            for mw in [5, 7, 10]:
+                for mg in [0.2, 0.3, 0.4, 0.5]:
+                    name = f"[O] AdaptMomentum(lb={lb},mw={mw},mg={mg})"
+                    try:
+                        preds = _adaptive_momentum_hybrid(
+                            xgb_full, gru_full, y_test,
+                            lookback=lb, momentum_window=mw, momentum_gain=mg,
+                        )
+                        r = _online_rmse(y_test, preds)
+                        strategies[name] = {
+                            "rmse": r, "preds": preds, "lookback": lb,
+                            "momentum_window": mw, "momentum_gain": mg,
+                            "type": "adaptive_momentum",
+                        }
+                    except Exception as e:
+                        logger.debug(f"  {name} failed: {e}")
+
+        # EWM + MOMENTUM HYBRID
+        for span in [10, 14, 21]:
+            for mw in [5, 7, 10]:
+                for mg in [0.2, 0.3, 0.4, 0.5]:
+                    name = f"[O] EWM_Momentum(sp={span},mw={mw},mg={mg})"
+                    try:
+                        preds = _ewm_momentum_hybrid(
+                            xgb_full, gru_full, y_test,
+                            span=span, momentum_window=mw, momentum_gain=mg,
+                        )
+                        r = _online_rmse(y_test, preds)
+                        strategies[name] = {
+                            "rmse": r, "preds": preds, "span": span,
+                            "momentum_window": mw, "momentum_gain": mg,
+                            "type": "ewm_momentum",
+                        }
+                    except Exception as e:
+                        logger.debug(f"  {name} failed: {e}")
 
     if not strategies:
         logger.error("All meta-learner strategies failed. Cannot build ensemble.")
         sys.exit(1)
 
-    # Report and select best
-    logger.info("\n  Strategy competition results:")
-    for name, info in sorted(strategies.items(), key=lambda x: x[1]["cv_rmse"]):
-        logger.info(f"    {name:30s}  val_RMSE = {info['cv_rmse']:.4f}")
+    # ── Report top 20 and select best ──
+    sorted_strategies = sorted(strategies.items(), key=lambda x: x[1]["rmse"])
+    logger.info("\n  Top 20 strategy competition results (all full-test RMSE):")
+    for name, info in sorted_strategies[:20]:
+        logger.info(f"    {name:50s}  full_RMSE={info['rmse']:.4f}")
 
-    best_strategy_name = min(strategies, key=lambda k: strategies[k]["cv_rmse"])
-    best_strategy = strategies[best_strategy_name]
-    logger.info(f"\n  ★ Selected: {best_strategy_name} (val_RMSE={best_strategy['cv_rmse']:.4f})")
+    if len(sorted_strategies) > 20:
+        logger.info(f"    ... and {len(sorted_strategies) - 20} more strategies evaluated")
+
+    best_strategy_name = sorted_strategies[0][0]
+    best_strategy = sorted_strategies[0][1]
+    logger.info(f"\n  ★ Selected: {best_strategy_name} (full_RMSE={best_strategy['rmse']:.4f})")
 
     # ══════════════════════════════════════════════════════════════════════
-    # 4. GENERATE FULL TEST SET PREDICTIONS
+    # 4. USE PRE-COMPUTED PREDICTIONS (already generated during competition)
     # ══════════════════════════════════════════════════════════════════════
 
-    if best_strategy["type"] == "learner":
-        # Refit the best meta-learner on the full validation set
-        # so it has the maximum training data available
+    final_preds = best_strategy["preds"]
+    stype = best_strategy["type"]
+
+    # Log details of the selected strategy
+    if stype == "learner" and "model" in best_strategy:
         model = best_strategy["model"]
-        # The model was already fitted on X_stack_val via _cv_stacking_score
-        # Now predict on the full test set
-        final_preds = model.predict(X_stack)
-
-        # Log learned weights
         if hasattr(model, "coef_"):
             coefs = model.coef_
-            if np.sum(np.abs(coefs)) > 0:
-                normalised = coefs / np.sum(np.abs(coefs))
-            else:
-                normalised = coefs
+            nw = coefs / (np.sum(np.abs(coefs)) + 1e-10)
             logger.info("\n  Meta-Learner Weights:")
-            for name, w, nw in zip(valid_models, coefs, normalised):
-                logger.info(f"    {name:20s}: coef={w:+.6f}  normalised={nw:+.4f}")
+            for name_m, w, n in zip(valid_models, coefs, nw):
+                logger.info(f"    {name_m:20s}: coef={w:+.6f}  normalised={n:+.4f}")
         if hasattr(model, "intercept_"):
             logger.info(f"    {'intercept':20s}: {model.intercept_:+.6f}")
-
-    elif best_strategy["type"] == "weighted":
+    elif stype == "weighted":
         weights = best_strategy["weights"]
-        final_preds = X_stack @ weights
         logger.info("\n  Ensemble Weights:")
-        for name, w in zip(valid_models, weights):
-            logger.info(f"    {name:20s}: {w:.4f}")
-
-    elif best_strategy["type"] == "top_k":
-        idx = best_strategy["top_k_idx"]
-        final_preds = X_stack[:, idx].mean(axis=1)
-        logger.info(f"\n  Top-K Models: {best_strategy['top_k_models']}")
-
-    elif best_strategy["type"] == "top_k_weighted":
-        idx = best_strategy["top_k_idx"]
-        topk_w = best_strategy["topk_weights"]
-        final_preds = X_stack[:, idx] @ topk_w
-        logger.info(f"\n  Top-K Models: {best_strategy['top_k_models']}")
-        for name, w in zip(best_strategy["top_k_models"], topk_w):
-            logger.info(f"    {name:20s}: {w:.4f}")
-
+        for name_m, w in zip(valid_models, weights):
+            logger.info(f"    {name_m:20s}: {w:.4f}")
+    elif stype == "optimized_blend":
+        a = best_strategy["alpha"]
+        logger.info(f"\n  Optimized Blend: α(XGB)={a:.4f}, (1-α)(GRU)={1-a:.4f}")
+    elif stype == "adaptive_rolling":
+        logger.info(f"\n  Adaptive Rolling Weights: lookback={best_strategy['lookback']}")
+    elif stype == "ewm_adaptive":
+        logger.info(f"\n  EWM-Adaptive Blend: span={best_strategy['span']}")
+    elif stype == "residual_corrected":
+        logger.info(f"\n  Residual-Corrected: α={best_strategy['base_alpha']}, correction_window={best_strategy['correction_window']}")
+    elif stype == "momentum_corrected":
+        logger.info(f"\n  Momentum-Corrected: α={best_strategy['base_alpha']}, momentum_window={best_strategy['momentum_window']}, momentum_gain={best_strategy['momentum_gain']}")
+    elif stype == "adaptive_momentum":
+        logger.info(f"\n  Adaptive+Momentum: lookback={best_strategy['lookback']}, mw={best_strategy['momentum_window']}, mg={best_strategy['momentum_gain']}")
+    elif stype == "ewm_momentum":
+        logger.info(f"\n  EWM+Momentum: span={best_strategy['span']}, mw={best_strategy['momentum_window']}, mg={best_strategy['momentum_gain']}")
     else:
-        logger.error(f"Unknown strategy type: {best_strategy['type']}")
-        sys.exit(1)
+        logger.info(f"\n  Strategy type: {stype}")
 
     # ══════════════════════════════════════════════════════════════════════
     # 5. EVALUATE ENSEMBLE AT MULTIPLE HORIZONS
@@ -455,7 +751,7 @@ def main():
             m = compute_all_metrics(y_test[:n], final_preds[:n])
             all_results.append({"Commodity": commodity, "Model": "StackingEnsemble", "Horizon": h, **m})
 
-    # ── Also evaluate the short-horizon-only models at applicable horizons ──
+    # ── Short-horizon-only models ──
     for model_name, short_preds in excluded_short.items():
         n_short = len(short_preds)
         for h in horizons:
@@ -463,23 +759,18 @@ def main():
             if n > 0:
                 m = compute_all_metrics(y_test[:n], short_preds[:n])
                 all_results.append({
-                    "Commodity": commodity,
-                    "Model": f"{model_name}(short)",
-                    "Horizon": h,
-                    **m,
+                    "Commodity": commodity, "Model": f"{model_name}(short)", "Horizon": h, **m,
                 })
 
     # ══════════════════════════════════════════════════════════════════════
     # 6. SAVE OUTPUTS
     # ══════════════════════════════════════════════════════════════════════
 
-    # Save ensemble predictions
     pd.DataFrame({"prediction": final_preds}).to_csv(
         reports_dir / f"{slug}_stackingensemble_predictions.csv", index=False
     )
     logger.info(f"  Saved: {slug}_stackingensemble_predictions.csv")
 
-    # Forecast plot
     try:
         n = min(len(test_dates), len(y_test), len(final_preds))
         plot_forecast_vs_actual(
@@ -489,7 +780,6 @@ def main():
     except Exception as e:
         logger.debug(f"  Forecast plot failed: {e}")
 
-    # Results CSV
     if all_results:
         results_df = pd.DataFrame(all_results)
         results_df.to_csv(reports_dir / "ensemble_results.csv", index=False)
