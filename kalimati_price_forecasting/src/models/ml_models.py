@@ -305,8 +305,13 @@ def predict_recursive_ml(
     n_train = len(train_df)
     n_test = len(test_df)
 
-    # Fill test portion of target with NaN to avoid any lookahead contamination
+    # Fill test portion of target, Minimum, and Maximum with NaN to avoid any lookahead contamination
     combined.loc[n_train:, target] = np.nan
+    if "Minimum" in combined.columns:
+        combined.loc[n_train:, "Minimum"] = np.nan
+    if "Maximum" in combined.columns:
+        combined.loc[n_train:, "Maximum"] = np.nan
+        
     predictions = []
 
     for i in range(n_test):
@@ -324,8 +329,12 @@ def predict_recursive_ml(
         pred_val = model.predict(X_curr)[0]
         predictions.append(pred_val)
 
-        # Update target in history for future lags/rolling stats
+        # Update target and price bounds in history for future lags/rolling stats
         combined.loc[idx, target] = pred_val
+        if "Minimum" in combined.columns:
+            combined.loc[idx, "Minimum"] = pred_val
+        if "Maximum" in combined.columns:
+            combined.loc[idx, "Maximum"] = pred_val
 
     return np.array(predictions)
 

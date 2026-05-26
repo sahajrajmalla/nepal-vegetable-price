@@ -336,6 +336,10 @@ def add_festival_features(
     fest_cols = [c for c in df.columns if c.startswith("fest_")]
     if fest_cols:
         df["fest_any"] = (df[fest_cols].sum(axis=1) > 0).astype(int)
+        
+        # Interaction features
+        if "is_weekend" in df.columns:
+            df["fest_weekend_interaction"] = df["fest_any"] * df["is_weekend"]
 
     n_festival_days = df["fest_any"].sum() if "fest_any" in df.columns else 0
     logger.info(f"Festival features: {len(festival_ranges)} festivals, "
@@ -388,6 +392,7 @@ def add_price_derived_features(
         df["price_velocity"] = velocity.shift(1)
         df["price_momentum_7"] = momentum.shift(1)
         df["price_acceleration"] = acceleration.shift(1)
+        df["squared_return"] = (velocity ** 2).shift(1)  # Volatility clustering
 
     if get_config_value(cfg, "features", "volatility", default=True):
         for window in [7, 14, 30]:
@@ -399,7 +404,34 @@ def add_price_derived_features(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Master Feature Engineering Pipeline
+# 8. STL Decomposition Features
+# ─────────────────────────────────────────────────────────────────────────────
+
+def add_stl_features(
+    df: pd.DataFrame,
+    target: str = "Average",
+) -> pd.DataFrame:
+    """
+    Extract trend, seasonal, and residual components using STL.
+    """
+    try:
+        from statsmodels.tsa.seasonal import STL
+        # Impute temporary NaNs purely for STL computation
+        temp_series = df[target].ffill().bfill()
+        stl = STL(temp_series, period=7, robust=True)
+        res = stl.fit()
+        df[f"{target}_trend"] = res.trend.shift(1)
+        df[f"{target}_seasonal"] = res.seasonal.shift(1)
+        df[f"{target}_resid"] = res.resid.shift(1)
+    except Exception as e:
+        logger.debug(f"STL failed for commodity (likely too short): {e}")
+        df[f"{target}_trend"] = 0
+        df[f"{target}_seasonal"] = 0
+        df[f"{target}_resid"] = 0
+    return df
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Master Feature Engineering Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -461,6 +493,10 @@ def engineer_features(
 
     # Price-derived
     df = add_price_derived_features(df, cfg)
+    
+    # STL Decomposition
+    if get_config_value(cfg, "features", "stl", default=True):
+        df = add_stl_features(df, target=target)
 
     # Count features
     n_features = len([c for c in df.columns if c not in

@@ -103,6 +103,10 @@ def parse_args() -> argparse.Namespace:
         help='Single commodity to forecast (e.g., "Tomato Big(Nepali)")'
     )
     parser.add_argument(
+        "--mode", type=str, choices=["DEV", "PROD"], default=None,
+        help="Run mode: DEV (fast testing) or PROD (full scale). Overrides MODE env var if set."
+    )
+    parser.add_argument(
         "--skip-dl", action="store_true",
         help="Skip deep learning models (faster execution)"
     )
@@ -209,6 +213,9 @@ def run_pipeline_for_commodity(
     if not skip_dl:
         stages.append("DL Models")
     stages.append("Hybrid Models")
+    if not skip_dl:
+        stages.append("SOTA Models")
+    stages.append("Ensemble")
     pbar = tqdm(stages, desc=f"  {commodity}", unit="stage", leave=True)
 
     # ─────────────────────────────────────────────────────────────────────
@@ -363,6 +370,94 @@ def run_pipeline_for_commodity(
         except Exception as e:
             logger.error(f"Hybrid models failed: {e}", exc_info=True)
     pbar.update(1)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 9. SOTA MODELS (NeuralForecast PatchTST & NBEATSx)
+    # ─────────────────────────────────────────────────────────────────────
+    if not skip_dl:
+        pbar.set_description(f"  {commodity} → SOTA (NeuralForecast)")
+        with timer(f"SOTA models — {commodity}", logger):
+            try:
+                from src.models.sota_models import train_sota_models, predict_sota
+                sota_features = [c for c in feature_cols if "fest" in c or "weekend" in c or "month" in c or "dayofweek" in c]
+                nf_model = train_sota_models(train_df, cfg, feature_cols=sota_features)
+                preds_df = predict_sota(nf_model, train_df, test_df, cfg, feature_cols=sota_features)
+                
+                preds_df["ds"] = pd.to_datetime(preds_df["ds"])
+                
+                # Merge with test dataset to align correctly
+                test_aligned = pd.DataFrame({"Date": test_dates})
+                test_aligned["Date"] = pd.to_datetime(test_aligned["Date"])
+                
+                merged = pd.merge(test_aligned, preds_df, left_on="Date", right_on="ds", how="left")
+                
+                for model_name in ["PatchTST", "NBEATSx"]:
+                    if model_name in merged.columns:
+                        pred_vals = merged[model_name].ffill().bfill().values
+                        model_predictions[model_name] = pred_vals
+                        all_results.extend(_compute_horizon_metrics(
+                            test_y_raw, pred_vals, horizons, commodity, model_name, compute_all_metrics
+                        ))
+            except Exception as e:
+                logger.error(f"SOTA models failed: {e}", exc_info=True)
+        pbar.update(1)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 10. STACKING ENSEMBLE
+    # ─────────────────────────────────────────────────────────────────────
+    pbar.set_description(f"  {commodity} → Ensemble")
+    with timer(f"Stacking Ensemble — {commodity}", logger):
+        try:
+            if len(model_predictions) > 1:
+                from sklearn.linear_model import Ridge
+                X_meta = pd.DataFrame(model_predictions)
+                # Trim to minimum length across models and actuals
+                min_len = min(len(test_y_raw), len(X_meta))
+                X_meta = X_meta.iloc[:min_len]
+                y_meta = test_y_raw[:min_len]
+                
+                val_size = int(len(y_meta) * 0.3)
+                if val_size >= 5:
+                    X_meta_train, y_meta_train = X_meta.iloc[:val_size], y_meta[:val_size]
+                    X_meta_test = X_meta # Predict on whole sequence
+                    
+                    # ── Dynamic Ensemble Selection (DES) ──
+                    # Rigorous methodology: Only admit models that outperform the naive baseline 
+                    # (i.e. R^2 > 0) on the validation set into the meta-learner.
+                    from sklearn.metrics import r2_score
+                    valid_models = []
+                    for col in X_meta_train.columns:
+                        if r2_score(y_meta_train, X_meta_train[col]) > 0:
+                            valid_models.append(col)
+                    
+                    if not valid_models:
+                        logger.warning("All models have R^2 < 0 on validation set. Skipping DES filtering.")
+                        valid_models = list(X_meta_train.columns)
+                    else:
+                        logger.info(f"Dynamic Ensemble Selection (DES): Retained {len(valid_models)} out of {len(X_meta_train.columns)} candidate models.")
+                        
+                    X_meta_train_des = X_meta_train[valid_models]
+                    X_meta_test_des = X_meta_test[valid_models]
+                    
+                    meta_learner = Ridge(alpha=1.0, positive=True)
+                    meta_learner.fit(X_meta_train_des, y_meta_train)
+                    ens_preds = meta_learner.predict(X_meta_test_des)
+                    
+                    model_predictions["StackingEnsemble"] = ens_preds
+                    all_results.extend(_compute_horizon_metrics(
+                        y_meta, ens_preds, horizons, commodity, "StackingEnsemble", compute_all_metrics
+                    ))
+                else:
+                    logger.warning("Test set too small for ensemble stacking. Averaging instead.")
+                    ens_preds = X_meta.mean(axis=1).values
+                    model_predictions["StackingEnsemble"] = ens_preds
+                    all_results.extend(_compute_horizon_metrics(
+                        y_meta, ens_preds, horizons, commodity, "StackingEnsemble", compute_all_metrics
+                    ))
+        except Exception as e:
+            logger.error(f"Stacking Ensemble failed: {e}", exc_info=True)
+    pbar.update(1)
+    
     pbar.close()
 
     # ─────────────────────────────────────────────────────────────────────
@@ -397,12 +492,37 @@ def run_pipeline_for_commodity(
 
 
 def main():
+    import os
     args = parse_args()
+
+    # Determine mode
+    mode = os.environ.get("MODE", "PROD").upper()
+    if args.mode:
+        mode = args.mode.upper()
 
     # Load config
     cfg = load_config(args.config)
     seed = cfg["project"]["random_seed"]
     set_global_seed(seed)
+    
+    # Apply DEV mode overrides if necessary
+    if mode == "DEV":
+        print("🔧 MODE=DEV: Overriding configurations for fast execution.")
+        # Reduce ML Optuna trials
+        if "ml" in cfg.get("models", {}):
+            for k in ["random_forest", "extra_trees", "xgboost", "hist_gb"]:
+                if k in cfg["models"]["ml"]:
+                    cfg["models"]["ml"][k]["n_iter_search"] = 2
+        # Reduce DL epochs
+        if "dl" in cfg.get("models", {}):
+            for k in ["lstm", "gru"]:
+                if k in cfg["models"]["dl"]:
+                    cfg["models"]["dl"][k]["epochs"] = 2
+        # Reduce SOTA max_steps
+        if "sota" in cfg.get("models", {}):
+            cfg["models"]["sota"]["max_steps"] = 5
+        # Ensure we only process one or two horizons
+        cfg["evaluation"]["horizons"] = [7]
 
     # Setup logging — only the root logger gets handlers
     logger = setup_logger(
@@ -443,7 +563,12 @@ def main():
         commodities = get_selected_commodities(cfg)
 
     available = cleaned_df["Commodity"].unique()
-    commodities = [c for c in commodities if c in available]
+    
+    # If the cache only contains the KVPI index, enforce KVPI as the commodity
+    if len(available) == 1 and available[0] == "KVPI":
+        commodities = ["KVPI"]
+    else:
+        commodities = [c for c in commodities if c in available]
 
     if not commodities:
         logger.error("No valid commodities found. Check config or --commodity flag.")

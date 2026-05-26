@@ -306,9 +306,9 @@ models:
       enabled: true
       description: "ARIMA residuals fed to LSTM"
 
-    arima_xgb:
+    arima_histgb:
       enabled: true
-      description: "ARIMA forecast as additional feature for XGBoost"
+      description: "ARIMA forecast as additional feature for HistGB"
 
 # ------------------------------------------------------------------
 # 9. Explainability

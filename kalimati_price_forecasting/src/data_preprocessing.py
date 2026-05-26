@@ -621,37 +621,65 @@ def create_vegetable_price_index(
         f"(excluded {n_excluded} with <{min_commodity_days} days of data)"
     )
 
-    # Step 2: Base-period mean (first 30 days of EACH commodity's own data)
+    # Step 2: Base-period mean and volatility (first 30 days of EACH commodity's own data)
     # This ensures late-entering commodities use their own initial prices,
     # not the global base period (which they may not appear in).
     first_dates = df_valid.groupby("Commodity")["Date"].min()
     base_records = {}
+    base_volatility = {}
     for c in valid_commodities:
         c_data = df_valid[df_valid["Commodity"] == c]
         c_base_end = first_dates[c] + pd.Timedelta(days=30)
-        c_base_mean = c_data[c_data["Date"] <= c_base_end][target].mean()
+        c_base_data = c_data[c_data["Date"] <= c_base_end][target]
+        c_base_mean = c_base_data.mean()
+        c_base_std = c_base_data.std()
+        
+        # Fallbacks
         if pd.isna(c_base_mean):
             c_base_mean = c_data[target].mean()
+            c_base_std = c_data[target].std()
         if pd.isna(c_base_mean) or c_base_mean == 0:
             c_base_mean = 1.0  # Fallback to avoid division by zero
-        base_records[c] = c_base_mean
-    base_means = pd.Series(base_records)
+        if pd.isna(c_base_std) or c_base_std == 0:
+            c_base_std = 1.0
 
-    # Step 3: Normalise
+        base_records[c] = c_base_mean
+        base_volatility[c] = c_base_std / c_base_mean  # Coefficient of Variation (CV)
+
+    base_means = pd.Series(base_records)
+    
+    # Calculate inverse volatility weights
+    # Commodities with high CV will have low weight, stabilizing the index
+    inv_cv = {c: 1.0 / v for c, v in base_volatility.items()}
+    total_inv_cv = sum(inv_cv.values())
+    weights = {c: inv_cv[c] / total_inv_cv for c in valid_commodities}
+    base_weights = pd.Series(weights)
+
+    # Step 3: Normalise and assign weights
     df_valid["_base_mean"] = df_valid["Commodity"].map(base_means)
+    df_valid["_weight"] = df_valid["Commodity"].map(base_weights)
     df_valid["_normalised"] = (df_valid[target] / df_valid["_base_mean"]) * 100
 
-    # Step 4: Daily index
+    # Step 4: Daily weighted index
+    # We use a custom apply to compute the weighted average for each day
+    # because not all commodities are present every day
+    def weighted_average(group):
+        w = group["_weight"]
+        v = group["_normalised"]
+        return (w * v).sum() / w.sum()
+        
+    kvpi_values = df_valid.groupby("Date").apply(weighted_average).rename("KVPI")
+    
     kvpi = (
         df_valid.groupby("Date")
         .agg(
-            KVPI=("_normalised", "mean"),
             KVPI_Median=("_normalised", "median"),
             N_Commodities=("Commodity", "nunique"),
             Avg_Price=(target, "mean"),
             Min_Price=(target, "min"),
             Max_Price=(target, "max"),
         )
+        .join(kvpi_values)
         .reset_index()
         .sort_values("Date")
         .reset_index(drop=True)
@@ -678,6 +706,8 @@ def create_vegetable_price_index(
     contrib = pd.DataFrame({
         "Commodity": valid_commodities,
         "Base_Mean_Price": [base_means.get(c, 0) for c in valid_commodities],
+        "CV_Volatility": [base_volatility.get(c, 0) for c in valid_commodities],
+        "Index_Weight": [base_weights.get(c, 0) for c in valid_commodities],
         "Total_Days": [counts.get(c, 0) for c in valid_commodities],
     }).sort_values("Commodity")
     contrib.to_csv(out_dir / "kvpi_commodity_contributions.csv", index=False)

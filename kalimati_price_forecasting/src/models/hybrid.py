@@ -9,9 +9,9 @@ nonlinear (LSTM/XGBoost) components:
        then train an LSTM on the residual sequence. Final forecast =
        ARIMA forecast + LSTM residual forecast.
 
-    2. **ARIMA–XGBoost Hybrid**: Use the ARIMA in-sample fitted values
+    2. **ARIMA–HistGB Hybrid**: Use the ARIMA in-sample fitted values
        as an additional feature alongside lag/calendar features, then
-       train XGBoost on the augmented feature set.
+       train HistGB on the augmented feature set.
 
 Motivation
 ----------
@@ -268,11 +268,11 @@ def fit_arima_lstm_hybrid(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 2. ARIMA–XGBOOST HYBRID
+# 2. ARIMA–HISTGB HYBRID
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-def predict_recursive_arima_xgb(
+def predict_recursive_arima_ml(
     model: Any,
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -281,7 +281,7 @@ def predict_recursive_arima_xgb(
     arima_fitted: np.ndarray,
     cfg: Dict[str, Any],
 ) -> np.ndarray:
-    """Generate recursive multi-step forecasts for ARIMA-XGBoost hybrid."""
+    """Generate recursive multi-step forecasts for ARIMA-ML hybrid."""
     from src.feature_engineering import engineer_features
 
     # Work on copies to prevent modifying caller's DataFrames
@@ -330,7 +330,7 @@ def predict_recursive_arima_xgb(
     return np.array(predictions)
 
 
-def fit_arima_xgb_hybrid(
+def fit_arima_histgb_hybrid(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
     cfg: Dict[str, Any],
@@ -338,12 +338,11 @@ def fit_arima_xgb_hybrid(
     seed: int = 42,
 ) -> Dict[str, Any]:
     """
-    Fit a hybrid ARIMA + XGBoost model.
+    Fit a hybrid ARIMA + HistGB model.
     """
     from src.models.statistical import fit_auto_arima, predict_arima
-    from src.models.ml_models import train_xgboost, get_xgb_feature_importance
+    from src.models.ml_models import train_hist_gb, get_hg_feature_importance
     from src.evaluation import compute_all_metrics
-    import xgboost as xgb
 
     target = cfg["preprocessing"]["target_column"]
     metrics_list = cfg.get("evaluation", {}).get("metrics", ["RMSE", "MAE", "MAPE", "sMAPE"])
@@ -354,7 +353,7 @@ def fit_arima_xgb_hybrid(
     ]
 
     logger.info("═" * 50)
-    logger.info("  ARIMA–XGBOOST HYBRID MODEL")
+    logger.info("  ARIMA–HISTGB HYBRID MODEL")
     logger.info("═" * 50)
 
     train_y = train_df[target].values
@@ -399,38 +398,44 @@ def fit_arima_xgb_hybrid(
 
     augmented_features = list(X_train.columns)
 
-    # Step 3: Train XGBoost on augmented features
-    logger.info("Step 3/3: Training XGBoost on augmented features …")
+    # Step 3: Train HistGB on augmented features
+    logger.info("Step 3/3: Training HistGB on augmented features …")
 
-    xgb_model, xgb_params = train_xgboost(X_train, y_train, cfg, seed)
+    histgb_model, histgb_params = train_hist_gb(X_train, y_train, cfg, seed)
 
     strategy = cfg["evaluation"].get("strategy", "recursive")
     if strategy == "recursive":
-        logger.info("Generating recursive out-of-sample forecast for ARIMA-XGBoost…")
-        xgb_pred = predict_recursive_arima_xgb(
-            xgb_model, train_df, test_df, numeric_features, arima_forecast, arima_fitted, cfg
+        logger.info("Generating recursive out-of-sample forecast for ARIMA-HistGB…")
+        ml_pred = predict_recursive_arima_ml(
+            histgb_model, train_df, test_df, numeric_features, arima_forecast, arima_fitted, cfg
         )
         # Recursive forecaster fills all values step-by-step, so use
         # the full test target for evaluation (not the NaN-masked subset)
         y_test_eval = test_df[target].values
     else:
-        logger.info("Generating one-step-ahead rolling forecast for ARIMA-XGBoost…")
-        xgb_pred = xgb_model.predict(X_test)
+        logger.info("Generating one-step-ahead rolling forecast for ARIMA-HistGB…")
+        ml_pred = histgb_model.predict(X_test)
         y_test_eval = y_test_valid.values
 
-    metrics = compute_all_metrics(y_test_eval, xgb_pred, metrics_list)
-    importance = get_xgb_feature_importance(xgb_model, augmented_features)
+    metrics = compute_all_metrics(y_test_eval, ml_pred, metrics_list)
+    
+    # Feature importance calculation wrapped safely
+    try:
+        importance = get_hg_feature_importance(histgb_model, X_train, y_train, augmented_features)
+    except Exception as e:
+        logger.warning(f"Failed to calculate permutation importance: {e}")
+        importance = None
 
-    logger.info(f"ARIMA–XGBoost Hybrid — RMSE: {metrics.get('RMSE', 'N/A'):.4f}")
+    logger.info(f"ARIMA–HistGB Hybrid — RMSE: {metrics.get('RMSE', 'N/A'):.4f}")
 
     return {
-        "predictions": xgb_pred,
+        "predictions": ml_pred,
         "y_test": y_test_eval,
         "metrics": metrics,
         "arima_model": arima_model,
-        "xgb_model": xgb_model,
+        "histgb_model": histgb_model,
         "feature_importance": importance,
-        "params": xgb_params,
+        "params": histgb_params,
     }
 
 
@@ -481,15 +486,15 @@ def run_hybrid_models(
             logger.error(f"ARIMA-LSTM hybrid failed: {e}", exc_info=True)
         gc.collect()
 
-    # ARIMA-XGBoost
-    if hybrid_cfg.get("arima_xgb", {}).get("enabled", True):
+    # ARIMA-HistGB
+    if hybrid_cfg.get("arima_histgb", {}).get("enabled", True):
         try:
-            result = fit_arima_xgb_hybrid(
+            result = fit_arima_histgb_hybrid(
                 train_df, test_df, cfg, feature_names, seed
             )
-            results["ARIMA_XGBoost"] = result
+            results["ARIMA_HistGB"] = result
         except Exception as e:
-            logger.error(f"ARIMA-XGBoost hybrid failed: {e}", exc_info=True)
+            logger.error(f"ARIMA-HistGB hybrid failed: {e}", exc_info=True)
         gc.collect()
 
     return results

@@ -544,6 +544,11 @@ def predict_recursive_dl(
     n_test = len(test_df)
 
     combined.loc[n_train:, target] = np.nan
+    if "Minimum" in combined.columns:
+        combined.loc[n_train:, "Minimum"] = np.nan
+    if "Maximum" in combined.columns:
+        combined.loc[n_train:, "Maximum"] = np.nan
+        
     predictions = []
 
     device = next(model.parameters()).device
@@ -577,6 +582,10 @@ def predict_recursive_dl(
 
         predictions.append(pred_val)
         combined.loc[idx, target] = pred_val
+        if "Minimum" in combined.columns:
+            combined.loc[idx, "Minimum"] = pred_val
+        if "Maximum" in combined.columns:
+            combined.loc[idx, "Maximum"] = pred_val
 
     return np.array(predictions)
 

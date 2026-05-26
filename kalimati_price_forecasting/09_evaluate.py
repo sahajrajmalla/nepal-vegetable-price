@@ -54,6 +54,8 @@ def main():
         "ml_results.csv": "Stage 4 (ML)",
         "dl_results.csv": "Stage 5 (DL)",
         "hybrid_results.csv": "Stage 6 (Hybrid)",
+        "sota_results.csv": "Stage 8 (SOTA NeuralForecast)",
+        "ensemble_results.csv": "Stage 9 (Stacking Ensemble)",
     }
 
     frames = []
@@ -113,6 +115,55 @@ def main():
             plot_model_comparison(all_results, "KVPI", cfg, metric="RMSE", horizon=horizon)
         except Exception:
             pass
+            
+    # Diebold-Mariano Tests
+    try:
+        from src.evaluation import diebold_mariano_test
+        from src.utils import sanitize_commodity_name
+        slug = sanitize_commodity_name("KVPI")
+        
+        # We need the true targets
+        # Assuming we can find the target from the preprocessing pipeline
+        from src.data_preprocessing import run_preprocessing_pipeline
+        from src.feature_engineering import engineer_features
+        from src.evaluation import fixed_split
+        
+        kvpi_df, _ = run_preprocessing_pipeline(cfg)
+        featured_df = engineer_features(kvpi_df, cfg, commodity="KVPI")
+        _, test_df = fixed_split(featured_df, cfg)
+        target = cfg["preprocessing"]["target_column"]
+        actual = test_df[target].values
+        
+        # Let's compare Ensemble with best ML/baseline
+        ens_pred_file = reports_dir / f"{slug}_stackingensemble_predictions.csv"
+        best_base_file = reports_dir / f"{slug}_histgb_predictions.csv" # Defaulting to HistGB as baseline
+        
+        if ens_pred_file.exists() and best_base_file.exists():
+            ens_pred = pd.read_csv(ens_pred_file)["prediction"].values
+            base_pred = pd.read_csv(best_base_file)["prediction"].values
+            
+            n_min = min(len(actual), len(ens_pred), len(base_pred))
+            
+            logger.info("\n" + "─" * 60)
+            logger.info("  DIEBOLD-MARIANO TEST (StackingEnsemble vs HistGB)")
+            logger.info("─" * 60)
+            
+            h = min(cfg["evaluation"]["horizons"])
+            res = diebold_mariano_test(actual[:n_min], base_pred[:n_min], ens_pred[:n_min], h=h, loss_type="MSE")
+            logger.info(f"DM Statistic: {res['DM_statistic']:.4f}")
+            logger.info(f"p-value     : {res['p_value']:.4e}")
+            if res['p_value'] < 0.05:
+                logger.info("Conclusion  : The difference in accuracy is statistically significant (p < 0.05).")
+            else:
+                logger.info("Conclusion  : The difference in accuracy is not statistically significant.")
+            
+            with open(md_path, "a", encoding="utf-8") as f:
+                f.write("\n## Statistical Significance (Diebold-Mariano Test)\n\n")
+                f.write("Comparing StackingEnsemble vs HistGB:\n")
+                f.write(f"- **DM Statistic**: {res['DM_statistic']:.4f}\n")
+                f.write(f"- **p-value**: {res['p_value']:.4e}\n")
+    except Exception as e:
+        logger.warning(f"Failed to run Diebold-Mariano test: {e}")
 
     # Best model per horizon
     if "RMSE" in all_results.columns:
