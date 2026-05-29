@@ -270,9 +270,9 @@ models:
     lstm:
       enabled: true
       sequence_length: 30
-      units: [64, 128]
-      n_layers: 2
-      dropout: 0.2
+      units: [64, 128]  # Default (overridden by Optuna if n_optuna_trials > 0)
+      n_layers: 2        # Default (overridden by Optuna if n_optuna_trials > 0)
+      dropout: 0.2       # Default (overridden by Optuna if n_optuna_trials > 0)
       recurrent_dropout: 0.1
       epochs: 100
       batch_size: 32
@@ -283,13 +283,14 @@ models:
       loss: "mse"
       bidirectional: false
       scaler: "minmax"  # "minmax" or "standard"
+      n_optuna_trials: 100  # Bayesian HPO trials (matches ML models)
 
     gru:
       enabled: true
       sequence_length: 30
-      units: [64, 128]
-      n_layers: 2
-      dropout: 0.2
+      units: [64, 128]  # Default (overridden by Optuna if n_optuna_trials > 0)
+      n_layers: 2        # Default (overridden by Optuna if n_optuna_trials > 0)
+      dropout: 0.2       # Default (overridden by Optuna if n_optuna_trials > 0)
       recurrent_dropout: 0.1
       epochs: 100
       batch_size: 32
@@ -300,6 +301,7 @@ models:
       loss: "mse"
       bidirectional: false
       scaler: "minmax"
+      n_optuna_trials: 100  # Bayesian HPO trials (matches ML models)
 
   hybrid:
     arima_lstm:

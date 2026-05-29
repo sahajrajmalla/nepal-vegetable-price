@@ -251,13 +251,16 @@ def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
 def detect_outliers(
     df: pd.DataFrame,
     cfg: Dict[str, Any],
+    train_end_date: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Flag and cap outliers using the IQR method combined with domain rules.
 
     Strategy
     --------
-    1. Per-commodity IQR bounds on the ``Average`` price.
+    1. Per-commodity IQR bounds on the ``Average`` price, computed
+       **exclusively from training data** (≤ train_end_date) to prevent
+       test-set leakage.
     2. Hard domain clamps: [min_price, max_price] from config.
     3. Flagged records are capped (winsorised), not dropped, to preserve
        temporal continuity.
@@ -269,6 +272,10 @@ def detect_outliers(
         Cleaned dataframe.
     cfg : dict
         Pipeline configuration (outlier thresholds).
+    train_end_date : str, optional
+        If provided, IQR bounds are computed only from data with
+        Date ≤ train_end_date.  This prevents test-set price
+        distributions from leaking into training preprocessing.
 
     Returns
     -------
@@ -280,19 +287,41 @@ def detect_outliers(
     price_max = cfg["preprocessing"]["outlier"]["max_price"]
     target = cfg["preprocessing"]["target_column"]
 
+    # Determine the training boundary for leakage-free IQR computation
+    if train_end_date is not None:
+        train_cutoff = pd.Timestamp(train_end_date)
+        train_mask_global = df["Date"] <= train_cutoff
+        logger.info(
+            f"Outlier detection: IQR bounds computed from training data only "
+            f"(≤ {train_cutoff.date()})"
+        )
+    else:
+        train_mask_global = pd.Series(True, index=df.index)
+        logger.warning(
+            "Outlier detection: No train_end_date provided — "
+            "IQR bounds computed on FULL dataset (potential leakage)"
+        )
+
     df["is_outlier"] = False
     n_outliers = 0
 
     for commodity in df["Commodity"].unique():
         mask = df["Commodity"] == commodity
-        series = df.loc[mask, target]
+        # Compute IQR bounds ONLY from training-period observations
+        train_series = df.loc[mask & train_mask_global, target]
 
-        q1 = series.quantile(0.25)
-        q3 = series.quantile(0.75)
+        if train_series.empty:
+            # Commodity has no training data — skip outlier detection
+            logger.debug(f"  {commodity}: no training data, skipping outlier detection")
+            continue
+
+        q1 = train_series.quantile(0.25)
+        q3 = train_series.quantile(0.75)
         iqr = q3 - q1
         lower = max(q1 - iqr_mult * iqr, price_min)
         upper = min(q3 + iqr_mult * iqr, price_max)
 
+        # Apply the training-derived bounds to ALL data (train + test)
         outlier_mask = mask & ((df[target] < lower) | (df[target] > upper))
         count = outlier_mask.sum()
         n_outliers += count
@@ -303,7 +332,7 @@ def detect_outliers(
                 f"(bounds: [{lower:.1f}, {upper:.1f}])"
             )
             df.loc[outlier_mask, "is_outlier"] = True
-            # Winsorise price columns (use per-commodity IQR bounds)
+            # Winsorise price columns (use training-derived IQR bounds)
             for col in ["Minimum", "Maximum", "Average"]:
                 df.loc[outlier_mask, col] = df.loc[outlier_mask, col].clip(
                     lower=lower, upper=upper
@@ -321,16 +350,24 @@ def detect_outliers(
 def impute_missing_dates(
     df: pd.DataFrame,
     cfg: Dict[str, Any],
+    train_end_date: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Ensure every commodity has a continuous daily index, then impute gaps.
 
+    When ``train_end_date`` is provided, imputation (forward-fill and
+    linear interpolation) is performed **independently** within the
+    training and test partitions.  This prevents future test-period
+    prices from leaking backward into training data via bidirectional
+    interpolation, and vice versa.
+
     Steps
     -----
     1. For each commodity, reindex to a full daily date range.
-    2. Forward-fill short gaps (≤ max_gap_days).
-    3. Linear interpolation for remaining NaN.
-    4. Flag imputed rows with ``is_imputed`` boolean.
+    2. Split at train_end_date boundary (if provided).
+    3. Forward-fill short gaps (≤ max_gap_days) within each partition.
+    4. Linear interpolation for remaining NaN within each partition.
+    5. Flag imputed rows with ``is_imputed`` boolean.
 
     Parameters
     ----------
@@ -338,6 +375,9 @@ def impute_missing_dates(
         Deduplicated, outlier-treated dataframe.
     cfg : dict
         Pipeline configuration (imputation settings).
+    train_end_date : str, optional
+        If provided, imputation is constrained within train/test
+        partitions independently to prevent cross-split leakage.
 
     Returns
     -------
@@ -347,6 +387,13 @@ def impute_missing_dates(
     max_gap = cfg["preprocessing"]["imputation"]["max_gap_days"]
     target = cfg["preprocessing"]["target_column"]
     price_cols = cfg["preprocessing"]["price_columns"]
+
+    train_cutoff = pd.Timestamp(train_end_date) if train_end_date else None
+    if train_cutoff is not None:
+        logger.info(
+            f"Missing date imputation: interpolation constrained within "
+            f"train/test partitions (boundary: {train_cutoff.date()})"
+        )
 
     frames = []
 
@@ -361,11 +408,31 @@ def impute_missing_dates(
         # Flag imputed rows
         sub["is_imputed"] = sub[target].isna()
 
-        # Forward-fill then interpolate
-        sub[price_cols] = sub[price_cols].ffill(limit=max_gap)
-        sub[price_cols] = sub[price_cols].interpolate(
-            method="linear", limit_direction="both"
-        )
+        if train_cutoff is not None and sub.index.min() <= train_cutoff < sub.index.max():
+            # Split into train and test partitions and impute independently
+            train_part = sub.loc[sub.index <= train_cutoff].copy()
+            test_part = sub.loc[sub.index > train_cutoff].copy()
+
+            # Impute training partition independently
+            train_part[price_cols] = train_part[price_cols].ffill(limit=max_gap)
+            train_part[price_cols] = train_part[price_cols].interpolate(
+                method="linear", limit_direction="both"
+            )
+
+            # Impute test partition independently
+            test_part[price_cols] = test_part[price_cols].ffill(limit=max_gap)
+            test_part[price_cols] = test_part[price_cols].interpolate(
+                method="linear", limit_direction="both"
+            )
+
+            # Recombine
+            sub = pd.concat([train_part, test_part])
+        else:
+            # No split boundary or commodity falls entirely in one partition
+            sub[price_cols] = sub[price_cols].ffill(limit=max_gap)
+            sub[price_cols] = sub[price_cols].interpolate(
+                method="linear", limit_direction="both"
+            )
 
         # Fill metadata
         sub["Commodity"] = commodity
@@ -808,11 +875,17 @@ def run_preprocessing_pipeline(
     # Step 3: Dedup
     deduped_df = remove_duplicates(normalised_df)
 
-    # Step 4: Outliers
-    outlier_df = detect_outliers(deduped_df, cfg)
+    # Read train_end_date for leakage-free preprocessing
+    train_end_date = cfg.get("evaluation", {}).get("train_end_date", None)
+    if train_end_date:
+        logger.info(f"Leakage-free preprocessing: using train boundary {train_end_date}")
+
+    # Step 4: Outliers (IQR bounds from training data only)
+    outlier_df = detect_outliers(deduped_df, cfg, train_end_date=train_end_date)
 
     # Step 5: Impute missing dates for ALL commodities
-    imputed_df = impute_missing_dates(outlier_df, cfg)
+    # (interpolation constrained within train/test partitions)
+    imputed_df = impute_missing_dates(outlier_df, cfg, train_end_date=train_end_date)
 
     n_commodities = imputed_df["Commodity"].nunique()
     logger.info(f"Using ALL {n_commodities} commodities for KVPI construction")

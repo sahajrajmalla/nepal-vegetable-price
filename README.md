@@ -13,12 +13,12 @@ The pipeline predicts the KVPI across four distinct horizons: **7, 14, 30, and 9
 ## Key Features
 
 - **End-to-End Pipeline**: Handles everything from raw dirty CSVs (mixed date formats, currency prefixes) to final model evaluation.
-- **Robust Feature Engineering**: 67 features covering autoregressive lags, rolling statistics, STL decomposition, and exact Nepali festival offsets (Dashain, Tihar, Chhath, Holi, Teej, New Year).
+- **Robust Feature Engineering**: 67 features covering autoregressive lags, rolling statistics, and exact Nepali festival offsets (Dashain, Tihar, Chhath, Holi, Teej, New Year). *Note: Non-causal global smoothers like STL were explicitly disabled to guarantee zero data leakage.*
 - **Model Diversity**: 
   - *Baselines*: Naive, Seasonal Naive
   - *Statistical*: Auto-ARIMA, SARIMA
-  - *Tree-based ML*: Random Forest, ExtraTrees, HistGB, XGBoost (Bayesian optimized via Optuna)
-  - *Deep Learning*: LSTM, GRU (PyTorch)
+  - *Tree-based ML*: Random Forest, ExtraTrees, HistGB, XGBoost (Bayesian optimized via Optuna, 100 trials)
+  - *Deep Learning*: LSTM, GRU (PyTorch — mathematically leveled with full 67 features and identical 100-trial Optuna tuning)
   - *Hybrids*: ARIMA-LSTM, ARIMA-HistGB
   - *SOTA Transformers*: PatchTST, NBEATSx (NeuralForecast)
 - **Stacking Ensemble**: A dynamic ensemble selection (DES) meta-learner that filters out poor models dynamically on a validation holdout, combining the top 5 models using inverse-RMSE weighting.

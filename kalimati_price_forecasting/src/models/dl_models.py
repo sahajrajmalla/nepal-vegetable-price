@@ -590,6 +590,87 @@ def predict_recursive_dl(
     return np.array(predictions)
 
 
+def _optuna_dl_objective(
+    trial: "optuna.Trial",
+    model_class: type,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    n_features: int,
+    cfg: Dict[str, Any],
+    model_type: str,
+    seed: int,
+) -> float:
+    """
+    Optuna objective function for DL hyperparameter optimisation.
+
+    Searches over architecture (hidden sizes, layers, dropout) and
+    training parameters (learning rate, batch size) using the same
+    Bayesian TPE sampler used for tree-based models, ensuring a fair
+    and scientifically rigorous comparison.
+
+    Parameters
+    ----------
+    trial : optuna.Trial
+        Optuna trial object.
+    model_class : type
+        LSTMForecaster or GRUForecaster.
+    X_train : np.ndarray
+        Training sequences (n, seq_len, n_features).
+    y_train : np.ndarray
+        Training targets.
+    n_features : int
+        Number of input features per time step.
+    cfg : dict
+        Pipeline configuration.
+    model_type : str
+        'lstm' or 'gru'.
+    seed : int
+        Random seed.
+
+    Returns
+    -------
+    float
+        Best validation loss achieved during training.
+    """
+    _set_dl_seeds(seed)
+
+    # ── Search space (mirrors the breadth of ML model Optuna search) ──
+    n_layers = trial.suggest_int("n_layers", 1, 3)
+    hidden_sizes = []
+    for i in range(n_layers):
+        h = trial.suggest_categorical(f"hidden_size_{i}", [32, 64, 128, 256])
+        hidden_sizes.append(h)
+    dropout = trial.suggest_float("dropout", 0.05, 0.5)
+    lr = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
+    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+
+    # ── Build model ──
+    model = model_class(
+        n_features=n_features,
+        hidden_sizes=hidden_sizes,
+        n_layers=n_layers,
+        dropout=dropout,
+    )
+
+    # ── Train with the trial's hyperparameters ──
+    # Override config temporarily for this trial
+    trial_cfg = copy.deepcopy(cfg)
+    trial_cfg["models"]["dl"][model_type]["learning_rate"] = lr
+    trial_cfg["models"]["dl"][model_type]["batch_size"] = batch_size
+    # Use reduced patience for faster Optuna trials
+    trial_cfg["models"]["dl"][model_type]["patience"] = min(
+        10, trial_cfg["models"]["dl"][model_type].get("patience", 20)
+    )
+
+    trained_model, history = train_dl_model(
+        model, X_train, y_train, trial_cfg, model_type=model_type,
+    )
+
+    # Return best validation loss
+    best_val_loss = min(history["val_loss"])
+    return best_val_loss
+
+
 def run_dl_models(
     df: pd.DataFrame,
     cfg: Dict[str, Any],
@@ -597,8 +678,20 @@ def run_dl_models(
     seed: int = 42,
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Train and evaluate all DL models (LSTM, GRU).
+    Train and evaluate all DL models (LSTM, GRU) with Optuna Bayesian
+    hyperparameter optimisation.
+
+    Parity with ML models
+    ---------------------
+    * **All features**: DL models now receive the same full feature set
+      as tree-based ML models (no manual filtering).
+    * **Optuna HPO**: Architecture and training hyperparameters are
+      optimised using the same TPE sampler and trial budget as
+      XGBoost/RandomForest, ensuring a scientifically fair comparison.
     """
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
     from src.evaluation import compute_all_metrics
 
     _set_dl_seeds(seed)
@@ -608,28 +701,15 @@ def run_dl_models(
     dl_cfg = cfg.get("models", {}).get("dl", {})
     results = {}
 
-    # Select compact feature set for DL to avoid curse of dimensionality
-    dl_features = None
-    if feature_cols:
-        dl_feature_candidates = [
-            c for c in feature_cols
-            if any(k in c for k in [
-                "lag_1", "lag_2", "lag_3", "lag_7", "lag_14", "lag_21", "lag_30",
-                "roll_mean_7", "roll_mean_14", "roll_mean_30",
-                "roll_std_7", "roll_std_14", "roll_std_30",
-                "roll_min_7", "roll_max_7",
-                "ewma_7", "ewma_14", "ewma_30",
-                "diff_1", "diff_7",
-                "spread", "price_velocity", "price_momentum_7", "price_acceleration",
-                "volatility_7", "volatility_14", "volatility_30",
-                "sin_dayofyear", "cos_dayofyear",
-                "sin_dayofweek", "cos_dayofweek",
-                "sin_month", "cos_month",
-                "fest_any", "is_weekend",
-            ])
-        ]
-        if dl_feature_candidates:
-            dl_features = dl_feature_candidates
+    # ── Use ALL features (same as ML models) for fair comparison ──
+    # Previous versions restricted DL to ~36 manually selected features
+    # while ML models used all ~67.  This created an unfair advantage
+    # for tree-based models and would cause peer-review rejection.
+    dl_features = feature_cols  # Pass through ALL features
+    logger.info(
+        f"DL models using ALL {len(dl_features) if dl_features else 0} features "
+        f"(same as ML models for fair comparison)"
+    )
 
     scaler_type = dl_cfg.get("lstm", {}).get("scaler", "minmax")
 
@@ -655,23 +735,79 @@ def run_dl_models(
     strategy = cfg["evaluation"].get("strategy", "recursive")
     logger.info(f"Using forecasting strategy for DL: {strategy.upper()}")
 
+    # ── Helper: run Optuna HPO + final training for a DL model ──
+    def _train_with_optuna(model_class, model_type, model_cfg):
+        """Run Optuna search, then retrain with best params."""
+        n_trials = model_cfg.get("n_optuna_trials", 30)
+
+        if n_trials > 0:
+            logger.info(
+                f"{model_type.upper()} Optuna search: {n_trials} trials "
+                f"(hidden_sizes, n_layers, dropout, lr, batch_size)"
+            )
+            sampler = optuna.samplers.TPESampler(seed=seed)
+            study = optuna.create_study(direction="minimize", sampler=sampler)
+            study.optimize(
+                lambda trial: _optuna_dl_objective(
+                    trial, model_class,
+                    data["X_train"], data["y_train"],
+                    n_features, cfg, model_type, seed,
+                ),
+                n_trials=n_trials,
+                show_progress_bar=True,
+            )
+
+            best = study.best_params
+            best_val = study.best_value
+            logger.info(
+                f"{model_type.upper()} best Optuna params: {best}\n"
+                f"  Best val loss: {best_val:.6f}"
+            )
+
+            # Extract best architecture
+            best_n_layers = best["n_layers"]
+            best_hidden = [best[f"hidden_size_{i}"] for i in range(best_n_layers)]
+            best_dropout = best["dropout"]
+            best_lr = best["learning_rate"]
+            best_batch = best["batch_size"]
+
+            del study
+            import gc; gc.collect()
+        else:
+            # No Optuna — use config defaults (e.g., DEV mode)
+            best_hidden = model_cfg.get("units", [64, 128])
+            best_n_layers = model_cfg.get("n_layers", 2)
+            best_dropout = model_cfg.get("dropout", 0.2)
+            best_lr = model_cfg.get("learning_rate", 0.001)
+            best_batch = model_cfg.get("batch_size", 32)
+
+        # ── Retrain with best hyperparameters on full training data ──
+        _set_dl_seeds(seed)
+        final_model = model_class(
+            n_features=n_features,
+            hidden_sizes=best_hidden,
+            n_layers=best_n_layers,
+            dropout=best_dropout,
+        )
+
+        final_cfg = copy.deepcopy(cfg)
+        final_cfg["models"]["dl"][model_type]["learning_rate"] = best_lr
+        final_cfg["models"]["dl"][model_type]["batch_size"] = best_batch
+
+        trained_model, history = train_dl_model(
+            final_model, data["X_train"], data["y_train"],
+            final_cfg, model_type=model_type,
+        )
+        return trained_model, history
+
     # ── LSTM ──
     if dl_cfg.get("lstm", {}).get("enabled", True):
         try:
-            logger.info("── Training LSTM ──")
-            _set_dl_seeds(seed)
+            logger.info("── Training LSTM (with Optuna HPO) ──")
 
             lstm_cfg = dl_cfg.get("lstm", {})
-            lstm_model = LSTMForecaster(
-                n_features=n_features,
-                hidden_sizes=lstm_cfg.get("units", [64, 128]),
-                n_layers=lstm_cfg.get("n_layers", 2),
-                dropout=lstm_cfg.get("dropout", 0.2),
-            )
-
-            lstm_model, lstm_history = train_dl_model(
-                lstm_model, data["X_train"], data["y_train"],
-                cfg, model_type="lstm"
+            lstm_model, lstm_history = _train_with_optuna(
+                LSTMForecaster, "lstm", lstm_cfg
             )
 
             if strategy == "recursive":
@@ -720,20 +856,11 @@ def run_dl_models(
     # ── GRU ──
     if dl_cfg.get("gru", {}).get("enabled", True):
         try:
-            logger.info("── Training GRU ──")
-            _set_dl_seeds(seed)
+            logger.info("── Training GRU (with Optuna HPO) ──")
 
             gru_cfg = dl_cfg.get("gru", {})
-            gru_model = GRUForecaster(
-                n_features=n_features,
-                hidden_sizes=gru_cfg.get("units", [64, 128]),
-                n_layers=gru_cfg.get("n_layers", 2),
-                dropout=gru_cfg.get("dropout", 0.2),
-            )
-
-            gru_model, gru_history = train_dl_model(
-                gru_model, data["X_train"], data["y_train"],
-                cfg, model_type="gru"
+            gru_model, gru_history = _train_with_optuna(
+                GRUForecaster, "gru", gru_cfg
             )
 
             if strategy == "recursive":

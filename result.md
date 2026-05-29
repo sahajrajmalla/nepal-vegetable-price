@@ -1,5 +1,6 @@
 # Results and Discussion
 
+> **⚠️ NOTE ON PIPELINE REVISION:** The results presented below reflect a previous iteration of the forecasting pipeline. A major architectural update was just pushed to strictly eliminate all forms of data leakage (disabling non-causal STL decomposition, restricting IQR bounds and missing date imputation strictly to the training partition) and to mathematically level the playing field between Deep Learning and Machine Learning models (equal 67-feature sets and 100-trial Optuna budgets). **These results will be refreshed upon the completion of the new, fully leakage-free execution.**
 This section presents a comprehensive evaluation of the 14 individual forecasting models and the proposed **Momentum-Corrected Stacking Ensemble** meta-learner applied to the Kalimati Vegetable Price Index (KVPI). The models were evaluated over an out-of-sample test period (July 2022 to September 2023) across four distinct forecasting horizons: short-term (7 days), medium-term (14 and 30 days), and long-term (90 days). 
 
 ## Overall Model Performance

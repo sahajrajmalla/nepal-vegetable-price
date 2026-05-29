@@ -513,11 +513,12 @@ def main():
             for k in ["random_forest", "extra_trees", "xgboost", "hist_gb"]:
                 if k in cfg["models"]["ml"]:
                     cfg["models"]["ml"][k]["n_iter_search"] = 2
-        # Reduce DL epochs
+        # Reduce DL epochs and Optuna trials
         if "dl" in cfg.get("models", {}):
             for k in ["lstm", "gru"]:
                 if k in cfg["models"]["dl"]:
                     cfg["models"]["dl"][k]["epochs"] = 2
+                    cfg["models"]["dl"][k]["n_optuna_trials"] = 0  # Skip HPO in DEV
         # Reduce SOTA max_steps
         if "sota" in cfg.get("models", {}):
             cfg["models"]["sota"]["max_steps"] = 5

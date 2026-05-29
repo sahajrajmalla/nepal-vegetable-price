@@ -495,7 +495,9 @@ def engineer_features(
     df = add_price_derived_features(df, cfg)
     
     # STL Decomposition
-    if get_config_value(cfg, "features", "stl", default=True):
+    # WARNING: Disabled by default to prevent data leakage. STL uses global 
+    # smoothing, which leaks test-set target values into the training features.
+    if get_config_value(cfg, "features", "stl", default=False):
         df = add_stl_features(df, target=target)
 
     # Count features
