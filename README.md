@@ -78,6 +78,23 @@ Our top-performing model is the **Momentum-Corrected Online Stacking Ensemble** 
 
 
 
+## Citation
+
+If you use this work or codebase, please cite it as:
+
+```bibtex
+@misc{malla2026kalimativegetablepriceindex,
+      title={Kalimati Vegetable Price Index Forecasting with a Momentum Corrected Online Stacking Ensemble}, 
+      author={Sahaj Raj Malla},
+      year={2026},
+      eprint={2605.30720},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2605.30720}, 
+}
+```
+
 ## License
 
 Distributed under the GNU Affero General Public License v3 (AGPL-3.0). See the [LICENSE](LICENSE) file for details.
+
