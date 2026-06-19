@@ -1,4 +1,4 @@
-# Kalimati Vegetable Price Forecasting
+# Agricultural Commodity Price Index Forecasting with a Momentum Corrected Online Stacking Ensemble
 
 A robust, multi-horizon time-series forecasting pipeline built to predict daily wholesale vegetable prices at the Kalimati Fruits & Vegetables Market in Kathmandu, Nepal (2013-2023).
 
@@ -6,9 +6,9 @@ This repository contains the complete codebase for data processing, feature engi
 
 ## Overview
 
-Forecasting agricultural commodities in emerging markets is difficult due to extreme volatility, seasonality, and festival-driven price spikes. Instead of forecasting 100+ noisy individual items, this project constructs the **Kalimati Vegetable Price Index (KVPI)**—a custom, inverse-volatility weighted index of 135 commodities.
+Forecasting agricultural commodities in emerging markets is difficult due to extreme volatility, seasonality, and festival-driven price spikes. Instead of forecasting 100+ noisy individual items, this project constructs the **Agricultural Commodity Price Index (ACPI)**—a custom, inverse-volatility weighted index of 135 commodities.
 
-The pipeline predicts the KVPI across four distinct horizons: **7, 14, 30, and 90 days**.
+The pipeline predicts the ACPI across four distinct horizons: **7, 14, 30, and 90 days**.
 
 ## Key Features
 
@@ -33,7 +33,7 @@ kalimati_price_forecasting/
 ├── src/                # Core modules (preprocessing, feature eng, evaluation)
 │   └── models/         # Model architectures
 ├── 01_combine_data.py  # Data ingestion and cleaning
-├── 02_preprocess.py    # Pipeline entry point for KVPI creation
+├── 02_preprocess.py    # Pipeline entry point for ACPI creation
 ├── 03_train_baselines.py 
 ├── ...                 # Individual training scripts per model family
 ├── 08_train_ensemble.py# Meta-learner stacking
